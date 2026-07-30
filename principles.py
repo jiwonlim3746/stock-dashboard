@@ -16,6 +16,8 @@
 #       "note": str | None,              # 경고/안내 문구 (예: 시클리컬 업종 경고)
 #   }
 
+import json
+import os
 import re
 import zipfile
 import io
@@ -31,6 +33,7 @@ import yfinance as yf
 
 from config import DART_API_KEY
 import financials
+from financials import DartUnavailableError
 from stock_data import get_korea_stock_name, get_krx_listing
 
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
@@ -94,8 +97,84 @@ US_SECTOR_PEERS = {
 
 
 # ------------------------------
+# peer 재무 데이터 캐시 (build_peer_cache.py로 미리 만들어둔 파일을 읽습니다)
+# ------------------------------
+#
+# peer는 종목 하나를 볼 때마다 여러 개(최대 5개)를 매번 실시간으로 조회해야 해서,
+# DART 호출 횟수를 크게 늘리는 원인이었습니다. peer 값은 분기 실적 발표 전까지는
+# 자주 바뀌지 않으므로, build_peer_cache.py를 필요할 때 한 번 실행해서
+# peer_cache.json에 미리 계산해두고, 앱은 그 파일을 읽기만 하도록 바꿨습니다.
+# 캐시에 없는 peer(파일이 없거나 새로 추가된 종목)는 예전처럼 실시간으로 조회합니다.
+
+PEER_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "peer_cache.json")
+
+
+@st.cache_data(ttl=60 * 60)  # 파일 내용 자체는 자주 안 바뀌므로 1시간이면 충분합니다.
+def _load_peer_cache() -> dict:
+    """미리 계산해둔 peer_cache.json을 읽습니다.
+
+    파일이 없거나 손상됐으면 빈 딕셔너리를 반환합니다 - 이 경우 peer 조회는
+    (느리지만) 예전처럼 매번 실시간으로 이뤄지니 기능이 완전히 끊기지는 않습니다.
+    """
+    if not os.path.exists(PEER_CACHE_PATH):
+        return {}
+    try:
+        with open(PEER_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _get_peer_metrics(market: str, ticker: str) -> dict:
+    """peer 종목의 PER/PBR/영업이익률/매출총이익률을 가져옵니다.
+
+    peer_cache.json에 값이 있으면 그대로 쓰고(DART/yfinance 호출 없음),
+    없으면 그 peer 하나에 한해서만 실시간으로 조회합니다(실패해도 죽지 않게 감쌉니다).
+    """
+    cache = _load_peer_cache()
+    cached = cache.get(market, {}).get(ticker)
+    if cached is not None:
+        return cached
+
+    if market == "KR":
+        fin, _ = _safe_call(financials.get_korea_financials, ticker, years=1)
+        gross_margin, _ = _safe_call(get_gross_margin, ticker)
+    else:
+        fin, _ = _safe_call(financials.get_us_financials, ticker, years=1)
+        gross_margin, _ = _safe_call(_get_us_gross_margin, ticker)
+    fin = fin or dict(financials.EMPTY_RESULT)
+
+    operating_margin = None
+    if not fin["income"].empty:
+        row = fin["income"].iloc[-1]
+        # .get()을 씁니다 - 미국 은행주(JPM 등)처럼 "영업이익"이라는 표준 계정 자체가
+        # 없는 업종은 row["영업이익"]처럼 대괄호로 접근하면 KeyError가 납니다.
+        revenue = row.get("매출액")
+        operating_income = row.get("영업이익")
+        if revenue and operating_income is not None:
+            operating_margin = operating_income / revenue * 100
+
+    return {"per": fin["per"], "pbr": fin["pbr"], "gross_margin": gross_margin, "operating_margin": operating_margin}
+
+
+# ------------------------------
 # 공용 유틸리티
 # ------------------------------
+
+def _safe_call(fn, *args, **kwargs) -> tuple:
+    """DART/yfinance 등 외부 API를 호출하는 함수를 감싸서, 실패해도 예외가 앱까지
+    올라가지 않게 합니다. (Streamlit Cloud처럼 DART 접속이 느리거나 끊기는 환경 대비)
+
+    반환값: (결과 또는 None, 실패 여부)
+    실패 여부가 True인 항목은 "데이터 없음 (조회 실패)"처럼 표시해서, 진짜로 데이터가
+    없는 경우와 구분합니다. DartUnavailableError뿐 아니라 예상 못한 다른 오류(라이브러리
+    버전 차이, 파싱 실패 등)까지 넓게 잡아서, 이 축 하나가 죽어도 나머지 축은 정상 표시되게 합니다.
+    """
+    try:
+        return fn(*args, **kwargs), False
+    except Exception:
+        return None, True
+
 
 def _to_number(value) -> Optional[float]:
     """DART API가 '1,234' 또는 '-' 형태로 주는 값을 숫자로 변환합니다."""
@@ -175,6 +254,7 @@ def _make_axis_result(score_items: list, citation: str, note: Optional[str] = No
         "items": score_items,
         "citation": citation,
         "note": note,
+        "fetch_failed": any(it.get("fetch_failed") for it in score_items),
     }
 
 
@@ -200,6 +280,7 @@ def _make_weighted_axis_result(score_items: list, weights: list, citation: str, 
         "items": score_items,
         "citation": citation,
         "note": note,
+        "fetch_failed": any(it.get("fetch_failed") for it in score_items),
     }
 
 
@@ -209,16 +290,22 @@ def _make_weighted_axis_result(score_items: list, weights: list, citation: str, 
 
 @st.cache_data(ttl=3600)
 def _dart_get(endpoint: str, corp_code: str, year: int, reprt_code: str = "11011") -> pd.DataFrame:
-    """정기보고서 주요정보류 API 공통 호출 (list 형태 응답을 DataFrame으로)."""
-    res = requests.get(
+    """정기보고서 주요정보류 API 공통 호출 (list 형태 응답을 DataFrame으로).
+
+    financials.py의 재시도(2회)+30초 타임아웃 헬퍼를 그대로 씁니다. 접속 자체가
+    실패하면(DartUnavailableError) 여기서 잡지 않고 그대로 던져서, [email protected]_data가
+    그 실패를 캐시하지 않게 합니다 (성공했을 때만 캐시되어, 다음 요청 때 재시도됨).
+    이 예외는 이 함수를 부르는 축(axis) 함수 쪽에서 항목 단위로 잡아서
+    "데이터 없음(조회 실패)"로 표시합니다.
+    """
+    res = financials._dart_request(
         f"{DART_BASE_URL}/{endpoint}",
-        params={
+        {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
             "bsns_year": str(year),
             "reprt_code": reprt_code,
         },
-        timeout=10,
     )
     data = res.json()
     if data.get("status") != "000":
@@ -367,48 +454,60 @@ def _score_roe_std(std: Optional[float]) -> Optional[float]:
 
 
 def get_korea_management_axis(ticker_code: str) -> dict:
-    """① 경영진의 역량과 도덕성 축을 계산합니다. (한국 주식)"""
-    major_pct = get_major_shareholder_pct(ticker_code)
-    streak = get_dividend_streak_years(ticker_code)
-    capital_count = get_paid_capital_increase_count(ticker_code)
-    audit = get_audit_opinion(ticker_code)
+    """① 경영진의 역량과 도덕성 축을 계산합니다. (한국 주식)
+
+    각 데이터 조회를 _safe_call로 감싸서, DART 접속이 실패한 항목만 "조회 실패"로
+    표시하고 나머지 항목은 정상적으로 채점되게 합니다.
+    """
+    major_pct, major_pct_failed = _safe_call(get_major_shareholder_pct, ticker_code)
+    streak, streak_failed = _safe_call(get_dividend_streak_years, ticker_code)
+    capital_count, capital_failed = _safe_call(get_paid_capital_increase_count, ticker_code)
+    audit, audit_failed = _safe_call(get_audit_opinion, ticker_code)
     opinion = audit["opinion"] if audit else None
 
-    fin5 = financials.get_korea_financials(ticker_code, years=5)
-    roe_values = fin5["trend"]["ROE"].tolist() if not fin5["trend"].empty else []
+    fin5, fin5_failed = _safe_call(financials.get_korea_financials, ticker_code, years=5)
+    roe_values = fin5["trend"]["ROE"].tolist() if fin5 and not fin5["trend"].empty else []
     roe_std = _std(roe_values)
+    roe_std_failed = fin5_failed or (fin5.get("fetch_failed") if fin5 else False)
+
+    def _dv(text_if_failed: str, value_text: str, failed: bool) -> str:
+        return text_if_failed if failed else value_text
 
     items = [
         {
             "label": "배당 연속 지급 연수",
-            "value_text": f"{streak}년 연속" if streak is not None else "데이터 없음",
+            "value_text": _dv("데이터 없음 (조회 실패)", f"{streak}년 연속" if streak is not None else "데이터 없음", streak_failed),
             "score": _score_dividend_streak(streak),
             "detail": "최근 연도부터 역순으로 현금배당금총액이 있는 연도를 셉니다. (DART 배당에 관한 사항)",
+            "fetch_failed": streak_failed,
         },
         {
             "label": "최근 5년 유상증자 횟수",
-            "value_text": f"{capital_count}회" if capital_count is not None else "데이터 없음",
+            "value_text": _dv("데이터 없음 (조회 실패)", f"{capital_count}회" if capital_count is not None else "데이터 없음", capital_failed),
             "score": _score_capital_increase_count(capital_count),
             "detail": "최근 5개 사업연도의 증자(감자) 현황에서 '유상증자'로 표시된 건수를 셉니다.",
+            "fetch_failed": capital_failed,
         },
         {
             "label": "감사의견",
-            "value_text": (f"{opinion} ({audit['year']}년 기준)" if audit else "데이터 없음"),
+            "value_text": _dv("데이터 없음 (조회 실패)", (f"{opinion} ({audit['year']}년 기준)" if audit else "데이터 없음"), audit_failed),
             "score": _score_audit_opinion(opinion),
             "detail": "회계감사인 감사의견입니다. DART가 최근 1~2개년치는 이 항목을 비워두는 경우가 있어, 실제로 값이 있는 가장 최근 연도(최대 5년 전까지)를 찾아서 보여줍니다.",
+            "fetch_failed": audit_failed,
         },
         {
             "label": "ROE 5년 표준편차",
-            "value_text": f"{roe_std:.2f}%p" if roe_std is not None else "데이터 없음",
+            "value_text": _dv("데이터 없음 (조회 실패)", f"{roe_std:.2f}%p" if roe_std is not None else "데이터 없음", roe_std_failed),
             "score": _score_roe_std(roe_std),
             "detail": "최근 5개년 ROE의 표준편차입니다. 낮을수록 자본배분이 안정적이라고 봅니다.",
+            "fetch_failed": roe_std_failed,
         },
     ]
 
     result = _make_axis_result(items, CITATIONS["관리"])
     result["info"] = {
         "label": "최대주주+특수관계인 지분율 (참고용, 점수 미반영)",
-        "value_text": f"{major_pct:.2f}%" if major_pct is not None else "데이터 없음",
+        "value_text": _dv("데이터 없음 (조회 실패)", f"{major_pct:.2f}%" if major_pct is not None else "데이터 없음", major_pct_failed),
         "detail": "지분율이 높다고 항상 좋은 것도, 낮다고 항상 나쁜 것도 아니라서(경영권 안정 vs 소액주주 이익 침해 우려는 반대 방향) 점수화하지 않고 참고 정보로만 표시합니다.",
     }
     return result
@@ -429,14 +528,16 @@ def get_gross_margin(ticker_code: str) -> Optional[float]:
 
     current_year = datetime.today().year
     for year in [current_year - 1, current_year - 2, current_year - 3]:
-        res = requests.get(
-            f"{DART_BASE_URL}/fnlttSinglAcntAll.json",
-            params={
-                "crtfc_key": DART_API_KEY, "corp_code": corp_code,
-                "bsns_year": str(year), "reprt_code": "11011", "fs_div": "CFS",
-            },
-            timeout=15,
-        )
+        try:
+            res = financials._dart_request(
+                f"{DART_BASE_URL}/fnlttSinglAcntAll.json",
+                {
+                    "crtfc_key": DART_API_KEY, "corp_code": corp_code,
+                    "bsns_year": str(year), "reprt_code": "11011", "fs_div": "CFS",
+                },
+            )
+        except DartUnavailableError:
+            continue  # 이 연도 조회만 실패한 것으로 보고 다른 연도를 시도합니다.
         data = res.json()
         if data.get("status") != "000":
             continue
@@ -457,22 +558,15 @@ def _get_kr_sector_for_ticker(ticker_code: str) -> Optional[str]:
 
 
 def _kr_peer_operating_margins(sector: str, exclude_ticker: str) -> list:
-    """같은 업종 대표 종목들의 최신 연도 영업이익률(%) 목록을 가져옵니다."""
+    """같은 업종 대표 종목들의 최신 연도 영업이익률(%) 목록을 가져옵니다. (peer_cache.json 우선 사용)"""
     peers = [p for p in KR_SECTOR_PEERS[sector]["peers"] if p != exclude_ticker]
-    margins = []
-    for peer in peers:
-        fin = financials.get_korea_financials(peer, years=1)
-        if fin["income"].empty:
-            continue
-        row = fin["income"].iloc[-1]
-        if row["매출액"]:
-            margins.append(row["영업이익"] / row["매출액"] * 100)
-    return margins
+    margins = [_get_peer_metrics("KR", p)["operating_margin"] for p in peers]
+    return [m for m in margins if m is not None]
 
 
 def _kr_peer_gross_margins(sector: str, exclude_ticker: str) -> list:
     peers = [p for p in KR_SECTOR_PEERS[sector]["peers"] if p != exclude_ticker]
-    margins = [get_gross_margin(p) for p in peers]
+    margins = [_get_peer_metrics("KR", p)["gross_margin"] for p in peers]
     return [m for m in margins if m is not None]
 
 
@@ -502,27 +596,36 @@ def get_korea_moat_axis(ticker_code: str) -> dict:
     변동성(표준편차)과 추세(매출 CAGR)에 가중치를 더 크게 뒀습니다.
     (예: 유통업처럼 원래 영업이익률이 낮은 업종이 절대 기준 때문에 불리해지는 것을 피하기 위함)
     """
-    fin5 = financials.get_korea_financials(ticker_code, years=5)
+    fin5, fin5_failed = _safe_call(financials.get_korea_financials, ticker_code, years=5)
+    fin5 = fin5 or dict(financials.EMPTY_RESULT)
+    fin5_failed = fin5_failed or fin5.get("fetch_failed", False)
     trend = fin5["trend"]
 
     op_margins = []
     if not trend.empty:
+        # .get()을 씁니다 - 미국 은행주 등은 "영업이익" 계정 자체가 없을 수 있어서
+        # row["영업이익"]로 바로 접근하면 KeyError가 납니다. (한국은 항상 값이 있어서
+        # .get()을 써도 동작은 동일합니다)
         op_margins = [
-            (row["영업이익"] / row["매출액"] * 100) if row["매출액"] else None
+            (row.get("영업이익") / row.get("매출액") * 100)
+            if row.get("매출액") and row.get("영업이익") is not None
+            else None
             for _, row in trend.iterrows()
         ]
     op_margin_latest = next((m for m in reversed(op_margins) if m is not None), None)
     op_margin_std = _std(op_margins)
     roe_avg = _avg(trend["ROE"].tolist()) if not trend.empty else None
 
-    fin3 = financials.get_korea_financials(ticker_code, years=3)
+    fin3, fin3_failed = _safe_call(financials.get_korea_financials, ticker_code, years=3)
+    fin3 = fin3 or dict(financials.EMPTY_RESULT)
+    fin3_failed = fin3_failed or fin3.get("fetch_failed", False)
     cagr = None
     if not fin3["income"].empty and len(fin3["income"]) >= 2:
         rev_first = fin3["income"].iloc[0]["매출액"]
         rev_last = fin3["income"].iloc[-1]["매출액"]
         cagr = _cagr(rev_first, rev_last, len(fin3["income"]) - 1)
 
-    gross_margin = get_gross_margin(ticker_code)
+    gross_margin, gross_margin_failed = _safe_call(get_gross_margin, ticker_code)
 
     sector = _get_kr_sector_for_ticker(ticker_code)
     op_margin_delta = gross_margin_delta = None
@@ -542,40 +645,49 @@ def get_korea_moat_axis(ticker_code: str) -> dict:
         {
             "label": "영업이익률 (peer 대비 상대수준)",
             "value_text": (
-                f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
-                if op_margin_latest is not None and op_margin_delta is not None
-                else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                "데이터 없음 (조회 실패)" if fin5_failed else (
+                    f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
+                    if op_margin_latest is not None and op_margin_delta is not None
+                    else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                )
             ),
             "score": _score_relative_margin(op_margin_delta),
             "detail": "최신 연도 영업이익률을 같은 업종 대표 종목 평균과 비교합니다. " + (peer_note or ""),
+            "fetch_failed": fin5_failed,
         },
         {
             "label": "영업이익률 5년 변동성",
-            "value_text": f"표준편차 {op_margin_std:.2f}%p" if op_margin_std is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin5_failed else (f"표준편차 {op_margin_std:.2f}%p" if op_margin_std is not None else "데이터 없음"),
             "score": _score_margin_std(op_margin_std),
             "detail": "최근 5개년 영업이익률의 표준편차입니다. 낮을수록 가격결정력(해자)이 안정적이라고 봅니다.",
+            "fetch_failed": fin5_failed,
         },
         {
             "label": "매출총이익률 (peer 대비 상대수준)",
             "value_text": (
-                f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
-                if gross_margin is not None and gross_margin_delta is not None
-                else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                "데이터 없음 (조회 실패)" if gross_margin_failed else (
+                    f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
+                    if gross_margin is not None and gross_margin_delta is not None
+                    else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                )
             ),
             "score": _score_relative_margin(gross_margin_delta),
             "detail": "매출총이익률(=매출총이익/매출액)을 같은 업종 대표 종목 평균과 비교합니다.",
+            "fetch_failed": gross_margin_failed,
         },
         {
             "label": "매출 3년 CAGR",
-            "value_text": f"연평균 {cagr:.1f}%" if cagr is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin3_failed else (f"연평균 {cagr:.1f}%" if cagr is not None else "데이터 없음"),
             "score": _score_cagr(cagr),
             "detail": "최근 3개년 매출액의 연평균 성장률입니다.",
+            "fetch_failed": fin3_failed,
         },
         {
             "label": "ROE 5년 평균",
-            "value_text": f"{roe_avg:.2f}%" if roe_avg is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin5_failed else (f"{roe_avg:.2f}%" if roe_avg is not None else "데이터 없음"),
             "score": _score_roe_avg(roe_avg),
             "detail": "최근 5개년 ROE의 평균입니다.",
+            "fetch_failed": fin5_failed,
         },
     ]
     weights = [0.15, 0.30, 0.15, 0.20, 0.20]
@@ -728,6 +840,8 @@ def get_korea_per_band_percentile(ticker_code: str) -> Optional[dict]:
         return None
 
     listing = get_krx_listing()
+    if listing.empty:  # KRX 목록 조회 자체가 실패한 경우 (빈 표에는 컬럼도 없어서 바로 걸러줍니다)
+        return None
     matched = listing.loc[listing["Code"] == ticker_code]
     if matched.empty or not matched.iloc[0].get("Stocks"):
         return None
@@ -793,7 +907,9 @@ def get_korea_per_band_percentile(ticker_code: str) -> Optional[dict]:
 
 def get_korea_valuation_axis(ticker_code: str) -> dict:
     """③ 수익성 및 밸류에이션 축을 계산합니다. (한국 주식)"""
-    fin = financials.get_korea_financials(ticker_code)
+    fin, fin_failed = _safe_call(financials.get_korea_financials, ticker_code)
+    fin = fin or dict(financials.EMPTY_RESULT)
+    fin_failed = fin_failed or fin.get("fetch_failed", False)
     per, pbr = fin["per"], fin["pbr"]
     net_income_latest = fin["income"].iloc[-1]["당기순이익"] if not fin["income"].empty else None
     is_loss = net_income_latest is not None and net_income_latest <= 0
@@ -807,14 +923,14 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
         peers = [p for p in KR_SECTOR_PEERS[sector]["peers"] if p != ticker_code]
         peer_pers, peer_pbrs, peer_details = [], [], []
         for peer in peers:
-            peer_fin = financials.get_korea_financials(peer, years=1)
+            peer_metrics = _get_peer_metrics("KR", peer)  # peer_cache.json 우선, 없으면 실시간 조회
             peer_details.append(
-                {"code": peer, "name": get_korea_stock_name(peer), "per": peer_fin["per"], "pbr": peer_fin["pbr"]}
+                {"code": peer, "name": get_korea_stock_name(peer), "per": peer_metrics["per"], "pbr": peer_metrics["pbr"]}
             )
-            if peer_fin["per"] and peer_fin["per"] > 0:
-                peer_pers.append(peer_fin["per"])
-            if peer_fin["pbr"] and peer_fin["pbr"] > 0:
-                peer_pbrs.append(peer_fin["pbr"])
+            if peer_metrics["per"] and peer_metrics["per"] > 0:
+                peer_pers.append(peer_metrics["per"])
+            if peer_metrics["pbr"] and peer_metrics["pbr"] > 0:
+                peer_pbrs.append(peer_metrics["pbr"])
         # peer가 2~3개뿐인 표본에서는 평균 대신 중앙값을 써야 극단값 하나에 덜 흔들립니다.
         if peer_pers and per and per > 0:
             peer_median_per = _median(peer_pers)
@@ -829,22 +945,24 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
 
     diverging_note = _diverging_valuation_note(per_delta_pct, pbr_delta_pct)
 
-    band = get_korea_per_band_percentile(ticker_code)
+    band, band_failed = _safe_call(get_korea_per_band_percentile, ticker_code)
     percentile = band["percentile"] if band else None
     out_of_range = band.get("out_of_range", False) if band else False
 
     items = [
         {
             "label": "PER",
-            "value_text": "적자 (PER 의미 없음)" if is_loss else (f"{per:.2f}배" if per is not None else "데이터 없음"),
+            "value_text": "데이터 없음 (조회 실패)" if fin_failed else ("적자 (PER 의미 없음)" if is_loss else (f"{per:.2f}배" if per is not None else "데이터 없음")),
             "score": _score_per(per, is_loss),
             "detail": "주가를 주당순이익으로 나눈 값입니다. 적자 기업은 PER이 의미가 없어 낮은 점수로 처리합니다.",
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PBR",
-            "value_text": f"{pbr:.2f}배" if pbr is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin_failed else (f"{pbr:.2f}배" if pbr is not None else "데이터 없음"),
             "score": _score_pbr(pbr),
             "detail": "주가를 주당순자산으로 나눈 값입니다.",
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PER peer 대비 (참고용)",
@@ -856,6 +974,7 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서(peer가 2~3개뿐이라 표본이 작음) "
                 "참고용으로만 보고, 아래 '3년 자기 PER 밴드'에 더 큰 비중을 뒀습니다."
             ),
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PBR peer 대비 (참고용)",
@@ -865,12 +984,15 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
                 "같은 업종 대표 종목 중앙값 PBR과 비교합니다." + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서 참고용으로만 봅니다."
             ),
+            "fetch_failed": fin_failed,
         },
         {
             "label": "3년 자기 PER 밴드 백분위",
             "value_text": (
-                f"백분위 {percentile:.0f}% (낮을수록 저평가)" + (" — 3년 밴드 범위를 벗어남" if out_of_range else "")
-                if percentile is not None else "데이터 없음"
+                "데이터 없음 (조회 실패)" if band_failed else (
+                    f"백분위 {percentile:.0f}% (낮을수록 저평가)" + (" — 3년 밴드 범위를 벗어남" if out_of_range else "")
+                    if percentile is not None else "데이터 없음"
+                )
             ),
             "score": _score_per_band_percentile(percentile),
             "detail": (
@@ -879,6 +1001,7 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
                 "(일별 정밀 계산이 아닌 연말 시점 근사치이며, 현재 순이익 기준: " + (band.get("eps_basis", "-") if band else "-") + ") "
                 + ("⚠️ 현재 PER이 최근 3년치보다 높거나 낮아 범위를 벗어났습니다 - 최근 추세(실적 증감 등)가 과거 3년과 달라졌다는 뜻일 수 있습니다." if out_of_range else "")
             ),
+            "fetch_failed": band_failed,
         },
     ]
 
@@ -930,7 +1053,10 @@ def get_buyback_years(ticker_code: str, years: int = 5) -> Optional[int]:
     count = 0
     checked_any = False
     for year in range(current_year - 1, current_year - 1 - years, -1):
-        df = _dart_get("tesstkAcqsDspsSttus.json", corp_code, year)
+        try:
+            df = _dart_get("tesstkAcqsDspsSttus.json", corp_code, year)
+        except DartUnavailableError:
+            continue  # 이 연도 조회만 실패한 것으로 보고 다른 연도는 계속 확인합니다.
         if df.empty or "change_qy_acqs" not in df.columns:
             continue
         checked_any = True
@@ -980,39 +1106,50 @@ def get_korea_shareholder_return_axis(ticker_code: str) -> dict:
     current_year = datetime.today().year
     years_to_check = [current_year - 1, current_year - 2, current_year - 3, current_year - 4, current_year - 5]
 
-    yearly = {y: get_dividend_detail(ticker_code, y) for y in years_to_check}
+    yearly = {}
+    dividend_detail_failed = False
+    for y in years_to_check:
+        result, failed = _safe_call(get_dividend_detail, ticker_code, y)
+        yearly[y] = result or {}
+        dividend_detail_failed = dividend_detail_failed or failed
     latest = yearly[years_to_check[0]]
 
     dps_series = [(y, yearly[y].get("dps")) for y in sorted(years_to_check)]
-    buyback_count = get_buyback_years(ticker_code)
+    buyback_count, buyback_failed = _safe_call(get_buyback_years, ticker_code)
 
     items = [
         {
             "label": "배당수익률",
-            "value_text": f"{latest.get('dividend_yield'):.2f}%" if latest.get("dividend_yield") is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if dividend_detail_failed else (f"{latest.get('dividend_yield'):.2f}%" if latest.get("dividend_yield") is not None else "데이터 없음"),
             "score": _score_dividend_yield(latest.get("dividend_yield")),
             "detail": "최근 사업연도 기준 현금배당수익률입니다.",
+            "fetch_failed": dividend_detail_failed,
         },
         {
             "label": "배당성향",
-            "value_text": f"{latest.get('payout_ratio'):.1f}%" if latest.get("payout_ratio") is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if dividend_detail_failed else (f"{latest.get('payout_ratio'):.1f}%" if latest.get("payout_ratio") is not None else "데이터 없음"),
             "score": _score_payout_ratio(latest.get("payout_ratio")),
             "detail": "당기순이익 중 배당으로 지급한 비율입니다. 너무 낮으면 주주환원이 부족하고, 너무 높으면(80% 초과) 지속가능성이 우려됩니다.",
+            "fetch_failed": dividend_detail_failed,
         },
         {
             "label": "5년 배당 증감 추이",
             "value_text": (
-                ", ".join(f"{y}:{v:,.0f}원" for y, v in dps_series if v is not None)
-                if any(v is not None for _, v in dps_series) else "데이터 없음"
+                "데이터 없음 (조회 실패)" if dividend_detail_failed and not any(v is not None for _, v in dps_series) else (
+                    ", ".join(f"{y}:{v:,.0f}원" for y, v in dps_series if v is not None)
+                    if any(v is not None for _, v in dps_series) else "데이터 없음"
+                )
             ),
             "score": _score_dividend_trend(dps_series),
             "detail": "최근 5개년 주당 현금배당금의 증감 추이입니다.",
+            "fetch_failed": dividend_detail_failed and not any(v is not None for _, v in dps_series),
         },
         {
             "label": "자기주식 취득 이력",
-            "value_text": f"최근 5년 중 {buyback_count}개 연도에서 취득" if buyback_count is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if buyback_failed else (f"최근 5년 중 {buyback_count}개 연도에서 취득" if buyback_count is not None else "데이터 없음"),
             "score": _score_buyback_years(buyback_count),
             "detail": "자기주식 취득 및 처분 현황에서, 실제로 순취득이 있었던 연도 수를 셉니다.",
+            "fetch_failed": buyback_failed,
         },
     ]
 
@@ -1030,7 +1167,13 @@ _NEW_BUSINESS_KEYWORDS = ["신규사업", "신규 사업", "사업다각화", "�
 
 @st.cache_data(ttl=60 * 60 * 24)
 def _get_business_report_text(ticker_code: str) -> Optional[str]:
-    """가장 최근 사업보고서 원문(전체 텍스트, 태그 미제거)을 가져옵니다."""
+    """가장 최근 사업보고서 원문(전체 텍스트, 태그 미제거)을 가져옵니다.
+
+    document.xml은 최대 수 MB짜리 zip이라 원래도 넉넉한 타임아웃(30초)을 썼는데,
+    이제 financials._dart_request로 재시도(2회)까지 함께 적용합니다. 접속이 완전히
+    실패하면(DartUnavailableError) 여기서 잡지 않고 그대로 던져서, 실패를 캐시하지 않고
+    호출한 쪽(get_rnd_detail, get_new_business_mentions)에서 항목 단위로 처리하게 합니다.
+    """
     if not DART_API_KEY:
         return None
     corp_code = _get_corp_code(ticker_code)
@@ -1039,14 +1182,13 @@ def _get_business_report_text(ticker_code: str) -> Optional[str]:
 
     end = datetime.today()
     start = end - timedelta(days=500)  # 사업보고서가 다음해 3~4월에 공시되는 것까지 여유있게 포함
-    res = requests.get(
+    res = financials._dart_request(
         f"{DART_BASE_URL}/list.json",
-        params={
+        {
             "crtfc_key": DART_API_KEY, "corp_code": corp_code,
             "bgn_de": start.strftime("%Y%m%d"), "end_de": end.strftime("%Y%m%d"),
             "pblntf_ty": "A", "page_count": 20,
         },
-        timeout=10,
     )
     data = res.json()
     rcept_no = None
@@ -1057,10 +1199,9 @@ def _get_business_report_text(ticker_code: str) -> Optional[str]:
     if not rcept_no:
         return None
 
-    doc_res = requests.get(
+    doc_res = financials._dart_request(
         f"{DART_BASE_URL}/document.xml",
-        params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
-        timeout=30,
+        {"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
     )
     try:
         with zipfile.ZipFile(io.BytesIO(doc_res.content)) as zf:
@@ -1164,14 +1305,16 @@ def get_capex_trend(ticker_code: str, years: int = 3) -> pd.DataFrame:
         if not revenue:
             continue
 
-        res = requests.get(
-            f"{DART_BASE_URL}/fnlttSinglAcntAll.json",
-            params={
-                "crtfc_key": DART_API_KEY, "corp_code": corp_code,
-                "bsns_year": str(year), "reprt_code": "11011", "fs_div": "CFS",
-            },
-            timeout=15,
-        )
+        try:
+            res = financials._dart_request(
+                f"{DART_BASE_URL}/fnlttSinglAcntAll.json",
+                {
+                    "crtfc_key": DART_API_KEY, "corp_code": corp_code,
+                    "bsns_year": str(year), "reprt_code": "11011", "fs_div": "CFS",
+                },
+            )
+        except DartUnavailableError:
+            continue  # 이 연도 조회만 실패한 것으로 보고 다른 연도를 시도합니다.
         data = res.json()
         if data.get("status") != "000":
             continue
@@ -1319,12 +1462,16 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
     R&D/매출 비율(최신 연도), R&D 금액의 절대 증감, CAPEX/매출 추이를 점수에 반영합니다.
     신규사업 언급은 사업보고서 원문에서 뽑은 문장을 인용으로만 보여주고 점수에는 넣지 않습니다.
     """
-    rnd = get_rnd_detail(ticker_code)
-    capex_df = get_capex_trend(ticker_code)
-    mentions = get_new_business_mentions(ticker_code)
+    rnd, rnd_failed = _safe_call(get_rnd_detail, ticker_code)
+    rnd = rnd or {"ratio": None, "report_ratio": None, "amount": None, "prior_amount": None}
+    capex_df, capex_failed = _safe_call(get_capex_trend, ticker_code)
+    capex_df = capex_df if capex_df is not None else pd.DataFrame()
+    mentions, mentions_failed = _safe_call(get_new_business_mentions, ticker_code)
+    mentions = mentions or []
 
     # R&D 비율 착시 방지를 위해 최근 2개년 매출액을 함께 봅니다.
-    fin2 = financials.get_korea_financials(ticker_code, years=2)
+    fin2, fin2_failed = _safe_call(financials.get_korea_financials, ticker_code, years=2)
+    fin2 = fin2 or dict(financials.EMPTY_RESULT)
     revenue_prior = revenue_latest = None
     if len(fin2["income"]) >= 2:
         revenue_prior = fin2["income"].iloc[-2]["매출액"]
@@ -1345,8 +1492,8 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
                 "우리는 항상 전체 연결 매출액 기준으로 계산합니다."
             )
 
-    rnd_value_text = "데이터 없음"
-    if rnd.get("ratio") is not None:
+    rnd_value_text = "데이터 없음 (조회 실패)" if rnd_failed else "데이터 없음"
+    if not rnd_failed and rnd.get("ratio") is not None:
         rnd_value_text = f"{rnd['ratio']:.2f}%"
         if rnd.get("report_ratio") is not None:
             rnd_value_text += f" (원문 명시: {rnd['report_ratio']}%)"
@@ -1355,8 +1502,8 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
         if rnd_warning:
             rnd_value_text = "⚠️ " + rnd_value_text
 
-    rnd_amount_text = "데이터 없음"
-    if rnd.get("amount") is not None:
+    rnd_amount_text = "데이터 없음 (조회 실패)" if rnd_failed else "데이터 없음"
+    if not rnd_failed and rnd.get("amount") is not None:
         if rnd.get("prior_amount") is not None:
             change_pct = (rnd["amount"] - rnd["prior_amount"]) / rnd["prior_amount"] * 100
             rnd_amount_text = f"{rnd['amount']:,}백만원 (전년대비 {change_pct:+.1f}%)"
@@ -1364,8 +1511,8 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
             rnd_amount_text = f"{rnd['amount']:,}백만원 (전년도 값은 표 형식상 추출 불가)"
 
     capex_level_score, capex_trend_score, capex_score = _score_capex(capex_df)
-    capex_text = "데이터 없음"
-    if not capex_df.empty:
+    capex_text = "데이터 없음 (조회 실패)" if capex_failed else "데이터 없음"
+    if not capex_failed and not capex_df.empty:
         series_text = ", ".join(f"{int(r['연도'])}:{r['CAPEX비율']:.1f}%" for _, r in capex_df.iterrows())
         level_text = f"{capex_level_score:.0f}점" if capex_level_score is not None else "N/A"
         trend_text = f"{capex_trend_score:.0f}점" if capex_trend_score is not None else "N/A"
@@ -1382,12 +1529,14 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
                 + (f"⚠️ {rnd_warning} " if rnd_warning else "")
                 + (f"⚠️ {rnd_discrepancy_note}" if rnd_discrepancy_note else "")
             ),
+            "fetch_failed": rnd_failed,
         },
         {
             "label": "R&D 금액 전년대비",
             "value_text": rnd_amount_text,
             "score": _score_rnd_amount_change(rnd.get("amount"), rnd.get("prior_amount")),
             "detail": "R&D '비율'이 아니라 실제로 투입한 금액 자체가 전년보다 늘었는지 줄었는지를 봅니다. (연결/별도를 나란히 적은 표 형식에서는 전년도 값을 안전하게 추출할 수 없어 '데이터 없음'으로 표시될 수 있습니다)",
+            "fetch_failed": rnd_failed,
         },
         {
             "label": "CAPEX/매출 (수준+추세)",
@@ -1400,12 +1549,14 @@ def get_korea_future_vision_axis(ticker_code: str) -> dict:
                 "흐름은 한 해 급감/급증이 아니라 3개년 전체 추세로 판단해서, 투자 사이클이 있는 "
                 "업종의 정상적인 한 해 감소에 과민 반응하지 않습니다."
             ),
+            "fetch_failed": capex_failed,
         },
     ]
 
     weights = [0.5, 0.25, 0.25]  # R&D 비율(수준) 50% / R&D 증감 25% / CAPEX 25%
     result = _make_weighted_axis_result(items, weights, CITATIONS["비전"])
     result["mentions"] = mentions
+    result["fetch_failed"] = result.get("fetch_failed") or mentions_failed
     return result
 
 
@@ -1463,10 +1614,13 @@ def get_us_dividend_streak_years(ticker: str) -> Optional[int]:
 
 def get_us_management_axis(ticker: str) -> dict:
     """① 경영진의 역량과 도덕성 축을 계산합니다. (미국 주식)"""
-    info = yf.Ticker(ticker).info
-    streak = get_us_dividend_streak_years(ticker)
+    info, info_failed = _safe_call(lambda: yf.Ticker(ticker).info)
+    info = info or {}
+    streak, streak_failed = _safe_call(get_us_dividend_streak_years, ticker)
 
-    fin5 = financials.get_us_financials(ticker, years=5)
+    fin5, fin5_failed = _safe_call(financials.get_us_financials, ticker, years=5)
+    fin5 = fin5 or dict(financials.EMPTY_RESULT)
+    fin5_failed = fin5_failed or fin5.get("fetch_failed", False)
     roe_values = fin5["trend"]["ROE"].tolist() if not fin5["trend"].empty else []
     roe_std = _std(roe_values)
 
@@ -1477,9 +1631,10 @@ def get_us_management_axis(ticker: str) -> dict:
     items = [
         {
             "label": "배당 연속 지급 연수",
-            "value_text": f"{streak}년 연속" if streak is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if streak_failed else (f"{streak}년 연속" if streak is not None else "데이터 없음"),
             "score": _score_dividend_streak(streak),
             "detail": "연도별 배당 지급 합계가 있었던 연속 연수입니다. (yfinance 배당 이력)",
+            "fetch_failed": streak_failed,
         },
         {
             "label": "최근 5년 유상증자 횟수",
@@ -1495,16 +1650,17 @@ def get_us_management_axis(ticker: str) -> dict:
         },
         {
             "label": "ROE 5년 표준편차",
-            "value_text": f"{roe_std:.2f}%p" if roe_std is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin5_failed else (f"{roe_std:.2f}%p" if roe_std is not None else "데이터 없음"),
             "score": _score_roe_std(roe_std),
             "detail": "최근 5개년 ROE의 표준편차입니다.",
+            "fetch_failed": fin5_failed,
         },
     ]
 
     result = _make_axis_result(items, CITATIONS["관리"])
     result["info"] = {
         "label": "내부자(경영진+이사회) 지분율 (참고용, 점수 미반영)",
-        "value_text": f"{insider_pct:.2f}%" if insider_pct is not None else "데이터 없음",
+        "value_text": "데이터 없음 (조회 실패)" if info_failed else (f"{insider_pct:.2f}%" if insider_pct is not None else "데이터 없음"),
         "detail": "한국의 '최대주주+특수관계인 지분율'과 완전히 같은 개념은 아닙니다 (지배주주 일가 지분이 아니라 경영진/이사회의 내부자 지분율에 가깝습니다). 참고용으로만 표시합니다.",
     }
     return result
@@ -1514,36 +1670,48 @@ def get_us_management_axis(ticker: str) -> dict:
 # ② 해자·확장성 (미국)
 # ------------------------------
 
+def _get_us_gross_margin(ticker: str) -> Optional[float]:
+    """최신 연도 매출총이익률(%)을 yfinance에서 계산합니다. (peer 계산에도 재사용)"""
+    financials_df = yf.Ticker(ticker).financials
+    if financials_df.empty or "Gross Profit" not in financials_df.index or "Total Revenue" not in financials_df.index:
+        return None
+    gross = financials_df.loc["Gross Profit"].iloc[0]
+    revenue = financials_df.loc["Total Revenue"].iloc[0]
+    return gross / revenue * 100 if revenue else None
+
+
 def get_us_moat_axis(ticker: str) -> dict:
     """② 비즈니스 모델의 확장성 및 진입 장벽(해자) 축을 계산합니다. (미국 주식)"""
-    fin5 = financials.get_us_financials(ticker, years=5)
+    fin5, fin5_failed = _safe_call(financials.get_us_financials, ticker, years=5)
+    fin5 = fin5 or dict(financials.EMPTY_RESULT)
+    fin5_failed = fin5_failed or fin5.get("fetch_failed", False)
     trend = fin5["trend"]
 
     op_margins = []
     if not trend.empty:
+        # .get()을 씁니다 - 미국 은행주 등은 "영업이익" 계정 자체가 없을 수 있어서
+        # row["영업이익"]로 바로 접근하면 KeyError가 납니다. (한국은 항상 값이 있어서
+        # .get()을 써도 동작은 동일합니다)
         op_margins = [
-            (row["영업이익"] / row["매출액"] * 100) if row["매출액"] else None
+            (row.get("영업이익") / row.get("매출액") * 100)
+            if row.get("매출액") and row.get("영업이익") is not None
+            else None
             for _, row in trend.iterrows()
         ]
     op_margin_latest = next((m for m in reversed(op_margins) if m is not None), None)
     op_margin_std = _std(op_margins)
     roe_avg = _avg(trend["ROE"].tolist()) if not trend.empty else None
 
-    fin3 = financials.get_us_financials(ticker, years=3)
+    fin3, fin3_failed = _safe_call(financials.get_us_financials, ticker, years=3)
+    fin3 = fin3 or dict(financials.EMPTY_RESULT)
+    fin3_failed = fin3_failed or fin3.get("fetch_failed", False)
     cagr = None
     if not fin3["income"].empty and len(fin3["income"]) >= 2:
         rev_first = fin3["income"].iloc[0]["매출액"]
         rev_last = fin3["income"].iloc[-1]["매출액"]
         cagr = _cagr(rev_first, rev_last, len(fin3["income"]) - 1)
 
-    yf_ticker = yf.Ticker(ticker)
-    gross_margin = None
-    financials_df = yf_ticker.financials
-    if not financials_df.empty and "Gross Profit" in financials_df.index and "Total Revenue" in financials_df.index:
-        gross = financials_df.loc["Gross Profit"].iloc[0]
-        revenue = financials_df.loc["Total Revenue"].iloc[0]
-        if revenue:
-            gross_margin = gross / revenue * 100
+    gross_margin, gross_margin_failed = _safe_call(_get_us_gross_margin, ticker)
 
     sector = _get_us_sector(ticker)
     op_margin_delta = gross_margin_delta = None
@@ -1552,18 +1720,11 @@ def get_us_moat_axis(ticker: str) -> dict:
         peers = [p for p in US_SECTOR_PEERS[sector]["peers"] if p != ticker]
         peer_op_margins, peer_gross_margins = [], []
         for peer in peers:
-            peer_fin = financials.get_us_financials(peer, years=1)
-            if not peer_fin["income"].empty:
-                row = peer_fin["income"].iloc[-1]
-                if row["매출액"]:
-                    peer_op_margins.append(row["영업이익"] / row["매출액"] * 100)
-            peer_yf = yf.Ticker(peer)
-            peer_fdf = peer_yf.financials
-            if not peer_fdf.empty and "Gross Profit" in peer_fdf.index and "Total Revenue" in peer_fdf.index:
-                p_gross = peer_fdf.loc["Gross Profit"].iloc[0]
-                p_revenue = peer_fdf.loc["Total Revenue"].iloc[0]
-                if p_revenue:
-                    peer_gross_margins.append(p_gross / p_revenue * 100)
+            peer_metrics = _get_peer_metrics("US", peer)  # peer_cache.json 우선, 없으면 실시간 조회
+            if peer_metrics["operating_margin"] is not None:
+                peer_op_margins.append(peer_metrics["operating_margin"])
+            if peer_metrics["gross_margin"] is not None:
+                peer_gross_margins.append(peer_metrics["gross_margin"])
         if peer_op_margins and op_margin_latest is not None:
             op_margin_delta = op_margin_latest - _avg(peer_op_margins)
         if peer_gross_margins and gross_margin is not None:
@@ -1576,40 +1737,49 @@ def get_us_moat_axis(ticker: str) -> dict:
         {
             "label": "영업이익률 (peer 대비 상대수준)",
             "value_text": (
-                f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
-                if op_margin_latest is not None and op_margin_delta is not None
-                else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                "데이터 없음 (조회 실패)" if fin5_failed else (
+                    f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
+                    if op_margin_latest is not None and op_margin_delta is not None
+                    else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                )
             ),
             "score": _score_relative_margin(op_margin_delta),
             "detail": "최신 연도 영업이익률을 같은 industry 대표 종목 평균과 비교합니다. " + (peer_note or ""),
+            "fetch_failed": fin5_failed,
         },
         {
             "label": "영업이익률 5년 변동성",
-            "value_text": f"표준편차 {op_margin_std:.2f}%p" if op_margin_std is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin5_failed else (f"표준편차 {op_margin_std:.2f}%p" if op_margin_std is not None else "데이터 없음"),
             "score": _score_margin_std(op_margin_std),
             "detail": "최근 5개년 영업이익률의 표준편차입니다.",
+            "fetch_failed": fin5_failed,
         },
         {
             "label": "매출총이익률 (peer 대비 상대수준)",
             "value_text": (
-                f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
-                if gross_margin is not None and gross_margin_delta is not None
-                else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                "데이터 없음 (조회 실패)" if gross_margin_failed else (
+                    f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
+                    if gross_margin is not None and gross_margin_delta is not None
+                    else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                )
             ),
             "score": _score_relative_margin(gross_margin_delta),
             "detail": "매출총이익률을 같은 industry 대표 종목 평균과 비교합니다.",
+            "fetch_failed": gross_margin_failed,
         },
         {
             "label": "매출 3년 CAGR",
-            "value_text": f"연평균 {cagr:.1f}%" if cagr is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin3_failed else (f"연평균 {cagr:.1f}%" if cagr is not None else "데이터 없음"),
             "score": _score_cagr(cagr),
             "detail": "최근 3개년 매출액의 연평균 성장률입니다.",
+            "fetch_failed": fin3_failed,
         },
         {
             "label": "ROE 5년 평균",
-            "value_text": f"{roe_avg:.2f}%" if roe_avg is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin5_failed else (f"{roe_avg:.2f}%" if roe_avg is not None else "데이터 없음"),
             "score": _score_roe_avg(roe_avg),
             "detail": "최근 5개년 ROE의 평균입니다.",
+            "fetch_failed": fin5_failed,
         },
     ]
     weights = [0.15, 0.30, 0.15, 0.20, 0.20]
@@ -1691,7 +1861,9 @@ def get_us_per_band_percentile(ticker: str) -> Optional[dict]:
 
 def get_us_valuation_axis(ticker: str) -> dict:
     """③ 수익성 및 밸류에이션 축을 계산합니다. (미국 주식)"""
-    fin = financials.get_us_financials(ticker)
+    fin, fin_failed = _safe_call(financials.get_us_financials, ticker)
+    fin = fin or dict(financials.EMPTY_RESULT)
+    fin_failed = fin_failed or fin.get("fetch_failed", False)
     per, pbr = fin["per"], fin["pbr"]
     net_income_latest = fin["income"].iloc[-1]["당기순이익"] if not fin["income"].empty else None
     is_loss = net_income_latest is not None and net_income_latest <= 0
@@ -1705,12 +1877,12 @@ def get_us_valuation_axis(ticker: str) -> dict:
         peers = [p for p in US_SECTOR_PEERS[sector]["peers"] if p != ticker]
         peer_pers, peer_pbrs, peer_details = [], [], []
         for peer in peers:
-            peer_fin = financials.get_us_financials(peer, years=1)
-            peer_details.append({"code": peer, "name": peer, "per": peer_fin["per"], "pbr": peer_fin["pbr"]})
-            if peer_fin["per"] and peer_fin["per"] > 0:
-                peer_pers.append(peer_fin["per"])
-            if peer_fin["pbr"] and peer_fin["pbr"] > 0:
-                peer_pbrs.append(peer_fin["pbr"])
+            peer_metrics = _get_peer_metrics("US", peer)  # peer_cache.json 우선, 없으면 실시간 조회
+            peer_details.append({"code": peer, "name": peer, "per": peer_metrics["per"], "pbr": peer_metrics["pbr"]})
+            if peer_metrics["per"] and peer_metrics["per"] > 0:
+                peer_pers.append(peer_metrics["per"])
+            if peer_metrics["pbr"] and peer_metrics["pbr"] > 0:
+                peer_pbrs.append(peer_metrics["pbr"])
         # peer가 2~3개뿐인 표본에서는 평균 대신 중앙값을 써야 극단값 하나에 덜 흔들립니다.
         if peer_pers and per and per > 0:
             peer_median_per = _median(peer_pers)
@@ -1725,22 +1897,24 @@ def get_us_valuation_axis(ticker: str) -> dict:
 
     diverging_note = _diverging_valuation_note(per_delta_pct, pbr_delta_pct)
 
-    band = get_us_per_band_percentile(ticker)
+    band, band_failed = _safe_call(get_us_per_band_percentile, ticker)
     percentile = band["percentile"] if band else None
     out_of_range = band.get("out_of_range", False) if band else False
 
     items = [
         {
             "label": "PER",
-            "value_text": "적자 (PER 의미 없음)" if is_loss else (f"{per:.2f}배" if per is not None else "데이터 없음"),
+            "value_text": "데이터 없음 (조회 실패)" if fin_failed else ("적자 (PER 의미 없음)" if is_loss else (f"{per:.2f}배" if per is not None else "데이터 없음")),
             "score": _score_per(per, is_loss),
             "detail": "적자 기업은 PER이 의미가 없어 낮은 점수로 처리합니다.",
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PBR",
-            "value_text": f"{pbr:.2f}배" if pbr is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fin_failed else (f"{pbr:.2f}배" if pbr is not None else "데이터 없음"),
             "score": _score_pbr(pbr),
             "detail": "주가를 주당순자산으로 나눈 값입니다.",
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PER peer 대비 (참고용)",
@@ -1752,6 +1926,7 @@ def get_us_valuation_axis(ticker: str) -> dict:
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서(peer가 2~3개뿐이라 표본이 작음) "
                 "참고용으로만 보고, 아래 '3년 자기 PER 밴드'에 더 큰 비중을 뒀습니다."
             ),
+            "fetch_failed": fin_failed,
         },
         {
             "label": "PBR peer 대비 (참고용)",
@@ -1761,12 +1936,15 @@ def get_us_valuation_axis(ticker: str) -> dict:
                 "같은 industry 대표 종목 중앙값 PBR과 비교합니다." + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서 참고용으로만 봅니다."
             ),
+            "fetch_failed": fin_failed,
         },
         {
             "label": "3년 자기 PER 밴드 백분위",
             "value_text": (
-                f"백분위 {percentile:.0f}% (낮을수록 저평가)" + (" — 3년 밴드 범위를 벗어남" if out_of_range else "")
-                if percentile is not None else "데이터 없음"
+                "데이터 없음 (조회 실패)" if band_failed else (
+                    f"백분위 {percentile:.0f}% (낮을수록 저평가)" + (" — 3년 밴드 범위를 벗어남" if out_of_range else "")
+                    if percentile is not None else "데이터 없음"
+                )
             ),
             "score": _score_per_band_percentile(percentile),
             "detail": (
@@ -1775,6 +1953,7 @@ def get_us_valuation_axis(ticker: str) -> dict:
                 + (band.get("eps_basis", "-") if band else "-") + ") "
                 + ("⚠️ 현재 PER이 최근 3년치보다 높거나 낮아 범위를 벗어났습니다." if out_of_range else "")
             ),
+            "fetch_failed": band_failed,
         },
     ]
 
@@ -1792,13 +1971,15 @@ def get_us_valuation_axis(ticker: str) -> dict:
 
 def get_us_shareholder_return_axis(ticker: str) -> dict:
     """④ 주주 환원 및 배당 성향 축을 계산합니다. (미국 주식)"""
-    info = yf.Ticker(ticker).info
+    info, info_failed = _safe_call(lambda: yf.Ticker(ticker).info)
+    info = info or {}
     dividend_yield = info.get("dividendYield")  # 이 필드는 yfinance에서 이미 %(예: 0.32=0.32%) 단위로 옵니다.
     payout_ratio = info.get("payoutRatio")
     if payout_ratio is not None:
         payout_ratio *= 100  # 이 필드는 소수(0.1259=12.59%) 단위라 100을 곱해줘야 합니다.
 
-    div = yf.Ticker(ticker).dividends
+    div, div_failed = _safe_call(lambda: yf.Ticker(ticker).dividends)
+    div = div if div is not None else pd.Series(dtype=float)
     dps_series = []
     if not div.empty:
         yearly = div.groupby(div.index.year).sum()
@@ -1806,7 +1987,8 @@ def get_us_shareholder_return_axis(ticker: str) -> dict:
         for year in range(current_year - 4, current_year + 1):
             dps_series.append((year, float(yearly[year]) if year in yearly.index else None))
 
-    cf = yf.Ticker(ticker).cashflow
+    cf, cf_failed = _safe_call(lambda: yf.Ticker(ticker).cashflow)
+    cf = cf if cf is not None else pd.DataFrame()
     buyback_count = None
     if not cf.empty and "Repurchase Of Capital Stock" in cf.index:
         buyback_row = cf.loc["Repurchase Of Capital Stock"]
@@ -1815,30 +1997,36 @@ def get_us_shareholder_return_axis(ticker: str) -> dict:
     items = [
         {
             "label": "배당수익률",
-            "value_text": f"{dividend_yield:.2f}%" if dividend_yield is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if info_failed else (f"{dividend_yield:.2f}%" if dividend_yield is not None else "데이터 없음"),
             "score": _score_dividend_yield(dividend_yield),
             "detail": "현재가 기준 배당수익률입니다.",
+            "fetch_failed": info_failed,
         },
         {
             "label": "배당성향",
-            "value_text": f"{payout_ratio:.1f}%" if payout_ratio is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if info_failed else (f"{payout_ratio:.1f}%" if payout_ratio is not None else "데이터 없음"),
             "score": _score_payout_ratio(payout_ratio),
             "detail": "당기순이익 중 배당으로 지급한 비율입니다.",
+            "fetch_failed": info_failed,
         },
         {
             "label": "5년 배당 증감 추이",
             "value_text": (
-                ", ".join(f"{y}:${v:,.2f}" for y, v in dps_series if v is not None)
-                if any(v is not None for _, v in dps_series) else "데이터 없음"
+                "데이터 없음 (조회 실패)" if div_failed else (
+                    ", ".join(f"{y}:${v:,.2f}" for y, v in dps_series if v is not None)
+                    if any(v is not None for _, v in dps_series) else "데이터 없음"
+                )
             ),
             "score": _score_dividend_trend(dps_series),
             "detail": "최근 5개년 연간 배당 합계(주당)의 증감 추이입니다.",
+            "fetch_failed": div_failed,
         },
         {
             "label": "자기주식 매입 이력",
-            "value_text": f"최근 {len(cf.columns) if not cf.empty else 0}개년 중 {buyback_count}개 연도에서 매입" if buyback_count is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if cf_failed else (f"최근 {len(cf.columns) if not cf.empty else 0}개년 중 {buyback_count}개 연도에서 매입" if buyback_count is not None else "데이터 없음"),
             "score": _score_buyback_years(buyback_count),
             "detail": "현금흐름표의 자사주 매입 지출(Repurchase Of Capital Stock)이 있었던 연도 수입니다.",
+            "fetch_failed": cf_failed,
         },
     ]
     return _make_axis_result(items, CITATIONS["환원"])
@@ -1856,8 +2044,11 @@ def get_us_future_vision_axis(ticker: str) -> dict:
     최신 연도 값만 안정적으로 뽑을 수 있었습니다)
     """
     yf_ticker = yf.Ticker(ticker)
-    fin_df = yf_ticker.financials
-    cf_df = yf_ticker.cashflow
+    fin_df, fin_df_failed = _safe_call(lambda: yf_ticker.financials)
+    fin_df = fin_df if fin_df is not None else pd.DataFrame()
+    cf_df, cf_df_failed = _safe_call(lambda: yf_ticker.cashflow)
+    cf_df = cf_df if cf_df is not None else pd.DataFrame()
+    fetch_failed = fin_df_failed or cf_df_failed
 
     rnd_ratios, capex_ratios = [], []
     if not fin_df.empty and "Total Revenue" in fin_df.index:
@@ -1895,25 +2086,28 @@ def get_us_future_vision_axis(ticker: str) -> dict:
     items = [
         {
             "label": "R&D/매출 비율 (최신 연도, 수준)",
-            "value_text": f"{rnd_latest:.2f}%" if rnd_latest is not None else "데이터 없음",
+            "value_text": "데이터 없음 (조회 실패)" if fetch_failed else (f"{rnd_latest:.2f}%" if rnd_latest is not None else "데이터 없음"),
             "score": _score_rnd_ratio(rnd_latest),
             "detail": "최근 연간 손익계산서의 Research And Development 항목을 매출액과 비교했습니다.",
+            "fetch_failed": fetch_failed,
         },
         {
             "label": "R&D 비율 추이",
-            "value_text": (", ".join(f"{v:.1f}%" for v in rnd_ratios) if rnd_ratios else "데이터 없음"),
+            "value_text": "데이터 없음 (조회 실패)" if fetch_failed else (", ".join(f"{v:.1f}%" for v in rnd_ratios) if rnd_ratios else "데이터 없음"),
             "score": _score_trend_change(rnd_ratios),
             "detail": "최근 수년간 R&D/매출 비율의 증감 추이입니다. (오래된 연도 -> 최신 연도 순)",
+            "fetch_failed": fetch_failed,
         },
         {
             "label": "CAPEX/매출 (수준+추세)",
-            "value_text": capex_text,
+            "value_text": "데이터 없음 (조회 실패)" if fetch_failed else capex_text,
             "score": capex_score,
             "detail": (
                 "설비투자(Capital Expenditure)를 매출액과 비교한 비율입니다. "
                 "'수준'(최신 연도 절대값, 60%)과 '전체 기간 흐름'(선형회귀 기울기, 40%)을 함께 봐서, "
                 "투자를 많이 하는 기업이 단순 증감 방향만으로 낮은 점수를 받지 않도록 했습니다."
             ),
+            "fetch_failed": fetch_failed,
         },
     ]
 

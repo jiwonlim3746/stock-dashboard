@@ -53,13 +53,21 @@ def get_krx_listing() -> pd.DataFrame:
     """KRX 전체 종목 목록(코드, 종목명, 시가총액 등)을 가져옵니다.
 
     financials.py에서 PER/PBR 계산에 필요한 시가총액(Marcap)을 가져올 때도 사용합니다.
+    이 함수는 종목 검색의 첫 단계에서부터 쓰이기 때문에, 여기서 예외가 그대로 터지면
+    앱이 아예 화면을 못 띄웁니다. 실패하면 빈 표를 돌려줘서 "종목을 찾을 수 없습니다"
+    같은 기존 안내 문구로 자연스럽게 이어지게 합니다.
     """
-    return fdr.StockListing("KRX")
+    try:
+        return fdr.StockListing("KRX")
+    except Exception:
+        return pd.DataFrame()
 
 
 def _get_krx_name_to_code_map() -> dict:
     """'종목명 -> 종목코드' 매핑 딕셔너리를 만듭니다. (전체 종목 대상)"""
     listing = get_krx_listing()
+    if listing.empty:  # 조회 실패 시 get_krx_listing()이 빈 표를 주는데, 그러면 컬럼도 없습니다.
+        return {}
     return dict(zip(listing["Name"], listing["Code"]))
 
 
@@ -77,6 +85,8 @@ def resolve_korea_ticker(query: str) -> Optional[str]:
 def get_korea_stock_name(ticker_code: str) -> str:
     """종목코드로 종목명을 조회합니다."""
     listing = get_krx_listing()
+    if listing.empty:
+        return ticker_code
     matched = listing.loc[listing["Code"] == ticker_code, "Name"]
     return matched.iloc[0] if not matched.empty else ticker_code
 
@@ -89,8 +99,10 @@ def get_korea_price_history(ticker_code: str) -> pd.DataFrame:
 
     # FinanceDataReader는 컬럼명이 이미 영문(Open/High/Low/Close/Volume)이라
     # 별도의 컬럼명 변환이 필요 없습니다.
-    df = fdr.DataReader(ticker_code, start_date, end_date)
-    return df
+    try:
+        return fdr.DataReader(ticker_code, start_date, end_date)
+    except Exception:
+        return pd.DataFrame()
 
 
 # ------------------------------
@@ -100,7 +112,10 @@ def get_korea_price_history(ticker_code: str) -> pd.DataFrame:
 @st.cache_data(ttl=3600)
 def get_us_price_history(ticker: str) -> pd.DataFrame:
     """최근 1년간 미국 주식의 일별 시세(OHLCV)를 가져옵니다."""
-    df = yf.download(ticker, period="1y", progress=False)
+    try:
+        df = yf.download(ticker, period="1y", progress=False)
+    except Exception:
+        return pd.DataFrame()
 
     # yfinance 최신 버전은 컬럼이 (필드, 티커) 형태의 멀티인덱스로 나올 수 있어서
     # 단순 컬럼으로 정리해줍니다.

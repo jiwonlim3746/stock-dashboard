@@ -34,12 +34,45 @@ from stock_data import get_krx_listing
 
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
 
+# Streamlit Cloud처럼 DART(국내 서버)와 지리적으로 먼 곳에서 앱을 돌리면 접속이 느리거나
+# 잠깐 끊길 수 있어서, 타임아웃을 넉넉히(30초) 주고 실패하면 2번까지 다시 시도합니다.
+DART_TIMEOUT = 30
+DART_MAX_RETRIES = 2
+
+
+class DartUnavailableError(Exception):
+    """DART API가 재시도까지 다 실패했을 때 발생시키는 예외입니다.
+
+    (DART가 정상 응답했지만 "해당 데이터 없음"이라고 답하는 것과는 다릅니다 -
+    그건 진짜로 데이터가 없는 것이고, 이 예외는 순수하게 "접속 자체가 실패"했을 때만 씁니다)
+    """
+
+
+def _dart_request(url: str, params: dict) -> requests.Response:
+    """DART API를 재시도(최대 2회 추가)와 30초 타임아웃으로 안전하게 호출합니다.
+
+    끝까지 실패하면 DartUnavailableError를 던집니다. 이 예외를 [email protected]_data가 붙은
+    함수 안에서 잡지 않고 그대로 내버려두면, Streamlit이 그 실패를 캐시하지 않아서
+    (성공할 때만 캐시됨) 다음 요청 때 다시 시도하게 됩니다.
+    """
+    last_error = None
+    for _ in range(DART_MAX_RETRIES + 1):
+        try:
+            res = requests.get(url, params=params, timeout=DART_TIMEOUT)
+            res.raise_for_status()
+            return res
+        except requests.exceptions.RequestException as e:
+            last_error = e
+    raise DartUnavailableError(f"DART API 호출 실패 (재시도 {DART_MAX_RETRIES}회 포함): {last_error}")
+
+
 EMPTY_RESULT = {
     "income": pd.DataFrame(),
     "trend": pd.DataFrame(),
     "per": None,
     "pbr": None,
     "roe": None,
+    "fetch_failed": False,  # DART 접속 실패로 데이터를 못 가져온 것인지(True) 아닌지(False)
 }
 
 
@@ -62,16 +95,28 @@ def _to_number(value) -> Optional[float]:
 
 @st.cache_data(ttl=60 * 60 * 24)  # 용량이 큰 파일이라 하루 동안만 캐시합니다.
 def get_dart_corp_code_map() -> dict:
-    """DART의 '종목코드 -> 고유번호(corp_code)' 매핑을 가져옵니다."""
+    """DART의 '종목코드 -> 고유번호(corp_code)' 매핑을 가져옵니다.
+
+    이 함수는 거의 모든 DART 조회의 첫 단계라서, 여기서 실패하면 뒤따르는 조회가
+    전부 "데이터 없음"이 됩니다. 그래서 예외를 밖으로 내보내지 않고 여기서 잡아
+    빈 딕셔너리를 반환합니다 (앱이 죽는 대신, 그 순간 DART 관련 항목들이 자연스럽게
+    "데이터 없음"으로 보이고 다음 새로고침 때 다시 시도됩니다).
+
+    알려진 한계: 이렇게 여기서 잡아버리면, "이 종목이 DART에 없음"과 "DART 접속
+    자체가 실패함"을 호출하는 쪽에서 구분할 수 없어서 "(조회 실패)" 표시가 안 붙습니다.
+    반대로 예외를 던지게 하면(캐시가 안 돼서) 이 함수를 쓰는 15개 안팎의 항목이 각자
+    재시도(최대 90초)를 반복하게 돼서 한 페이지가 통째로 멈춘 것처럼 느려집니다. corpCode.xml
+    자체가 완전히 죽는 경우는 흔치 않다고 보고, 빠르게 실패하는 쪽을 택했습니다. (반면
+    개별 종목/연도별 호출 - hyslrSttus, alotMatter 등 - 은 항목 단위로 정확히
+    "(조회 실패)"가 표시됩니다. 실제로 자주 발생하는 시나리오는 이쪽입니다)
+    """
     if not DART_API_KEY:
         return {}
 
-    res = requests.get(
-        f"{DART_BASE_URL}/corpCode.xml",
-        params={"crtfc_key": DART_API_KEY},
-        timeout=10,
-    )
-    res.raise_for_status()
+    try:
+        res = _dart_request(f"{DART_BASE_URL}/corpCode.xml", {"crtfc_key": DART_API_KEY})
+    except DartUnavailableError:
+        return {}
 
     # corpCode.xml은 zip 파일 형태로 내려옵니다.
     with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
@@ -92,16 +137,19 @@ def _get_dart_accounts(corp_code: str, year: int, reprt_code: str = "11011") -> 
     """특정 사업연도/보고서의 주요 계정(매출액/영업이익 등) 원본 데이터를 가져옵니다.
 
     reprt_code(보고서 종류): 11013=1분기보고서, 11012=반기보고서, 11014=3분기보고서, 11011=사업보고서(연간)
+
+    접속 자체가 실패하면(DartUnavailableError) 여기서는 잡지 않고 그대로 던집니다.
+    이 함수를 부르는 쪽(get_korea_financials 등)에서 "진짜 데이터 없음"과
+    "접속 실패"를 구분해서 처리하기 위함입니다.
     """
-    res = requests.get(
+    res = _dart_request(
         f"{DART_BASE_URL}/fnlttSinglAcnt.json",
-        params={
+        {
             "crtfc_key": DART_API_KEY,
             "corp_code": corp_code,
             "bsns_year": str(year),
             "reprt_code": reprt_code,
         },
-        timeout=10,
     )
     data = res.json()
 
@@ -149,8 +197,14 @@ def get_korea_financials(ticker_code: str, years: int = 3) -> dict:
     # 실제로 데이터가 있는 연도만 모읍니다. (혹시 중간에 결측 연도가 있을 수 있어 2년 여유를 둡니다)
     current_year = datetime.today().year
     records = []
+    fetch_failed = False
     for year in range(current_year - 1, current_year - 1 - (years + 2), -1):
-        df = _get_dart_accounts(corp_code, year)  # 기본값(reprt_code="11011")은 사업보고서(연간)
+        try:
+            df = _get_dart_accounts(corp_code, year)  # 기본값(reprt_code="11011")은 사업보고서(연간)
+        except DartUnavailableError:
+            # 이 연도 조회만 실패한 것으로 보고, 다른 연도는 계속 시도합니다.
+            fetch_failed = True
+            continue
         if df.empty:
             continue
 
@@ -161,7 +215,9 @@ def get_korea_financials(ticker_code: str, years: int = 3) -> dict:
             break
 
     if not records:
-        return EMPTY_RESULT
+        result = dict(EMPTY_RESULT)
+        result["fetch_failed"] = fetch_failed
+        return result
 
     full_df = pd.DataFrame(records).sort_values("연도").reset_index(drop=True)
 
@@ -186,8 +242,12 @@ def get_korea_financials(ticker_code: str, years: int = 3) -> dict:
     per = pbr = None
 
     # 현재 시가총액은 FinanceDataReader의 KRX 종목 목록에서 가져옵니다.
-    listing = get_krx_listing()
-    matched = listing.loc[listing["Code"] == ticker_code]
+    try:
+        listing = get_krx_listing()
+    except Exception:
+        listing = pd.DataFrame()
+        fetch_failed = True
+    matched = listing.loc[listing["Code"] == ticker_code] if not listing.empty else listing
     if not matched.empty:
         marcap = matched.iloc[0].get("Marcap")
         if marcap and net_income_latest:
@@ -195,7 +255,14 @@ def get_korea_financials(ticker_code: str, years: int = 3) -> dict:
         if marcap and equity_latest:
             pbr = marcap / equity_latest
 
-    return {"income": income_df, "trend": trend_df, "per": per, "pbr": pbr, "roe": roe}
+    return {
+        "income": income_df,
+        "trend": trend_df,
+        "per": per,
+        "pbr": pbr,
+        "roe": roe,
+        "fetch_failed": fetch_failed,
+    }
 
 
 # 분기 번호(1~4) -> DART 보고서 코드
@@ -231,11 +298,17 @@ def get_korea_quarterly_trend(ticker_code: str) -> pd.DataFrame:
     for year in [current_year, current_year - 1, current_year - 2, current_year - 3]:
         quarter_accounts = {}
         for q in (1, 2, 3):
-            df = _get_dart_accounts(corp_code, year, _QUARTER_REPRT_CODES[q])
+            try:
+                df = _get_dart_accounts(corp_code, year, _QUARTER_REPRT_CODES[q])
+            except DartUnavailableError:
+                continue  # 이 분기 조회만 실패한 것으로 보고 넘어갑니다 (앱을 죽이지 않기 위함)
             if not df.empty:
                 quarter_accounts[q] = _extract_accounts(df)
 
-        annual_df = _get_dart_accounts(corp_code, year, _QUARTER_REPRT_CODES[4])
+        try:
+            annual_df = _get_dart_accounts(corp_code, year, _QUARTER_REPRT_CODES[4])
+        except DartUnavailableError:
+            annual_df = pd.DataFrame()
         annual_accounts = _extract_accounts(annual_df) if not annual_df.empty else None
 
         # 1~3분기는 보고서에서 받은 값을 그대로 사용합니다 (이미 해당 분기 단독 실적).
@@ -300,8 +373,17 @@ def get_us_financials(ticker: str, years: int = 3) -> dict:
     yfinance는 무료로는 연간 재무제표를 최대 5개년까지만 제공합니다.
     """
     yf_ticker = yf.Ticker(ticker)
+    fetch_failed = False
 
-    financials_df = yf_ticker.financials  # 연간 손익계산서 (최근 연도가 첫 컬럼)
+    # yfinance는 내부적으로 requests를 쓰는데 예외 종류가 다양해서(네트워크 오류,
+    # 잘못된 응답 파싱 등) 넓게 Exception으로 잡습니다. 실패해도 앱이 죽지 않고
+    # "데이터 없음"으로 자연스럽게 넘어가게 하기 위함입니다.
+    try:
+        financials_df = yf_ticker.financials  # 연간 손익계산서 (최근 연도가 첫 컬럼)
+    except Exception:
+        financials_df = pd.DataFrame()
+        fetch_failed = True
+
     income_df = pd.DataFrame()
     trend_df = pd.DataFrame()
     if not financials_df.empty:
@@ -319,7 +401,11 @@ def get_us_financials(ticker: str, years: int = 3) -> dict:
         full_df.index.name = "연도"
 
         # 연도별 ROE 계산을 위해 대차대조표에서 같은 연도의 자기자본을 가져옵니다.
-        equity_row = _find_equity_row(yf_ticker.balance_sheet)
+        try:
+            equity_row = _find_equity_row(yf_ticker.balance_sheet)
+        except Exception:
+            equity_row = None
+            fetch_failed = True
         if equity_row is not None:
             equity_by_year = equity_row.rename(index=lambda c: c.year)
             full_df["ROE"] = full_df.apply(
@@ -335,14 +421,26 @@ def get_us_financials(ticker: str, years: int = 3) -> dict:
         income_df = full_df.drop(columns=["ROE"])  # 실적 표에는 손익 항목만 표시
         trend_df = full_df  # 추이 그래프에는 ROE까지 포함
 
-    info = yf_ticker.info
+    try:
+        info = yf_ticker.info
+    except Exception:
+        info = {}
+        fetch_failed = True
+
     per = info.get("trailingPE")
     pbr = info.get("priceToBook")
     roe = info.get("returnOnEquity")
     if roe is not None:
         roe = roe * 100  # 퍼센트로 변환
 
-    return {"income": income_df, "trend": trend_df, "per": per, "pbr": pbr, "roe": roe}
+    return {
+        "income": income_df,
+        "trend": trend_df,
+        "per": per,
+        "pbr": pbr,
+        "roe": roe,
+        "fetch_failed": fetch_failed,
+    }
 
 
 @st.cache_data(ttl=3600)
@@ -354,7 +452,10 @@ def get_us_quarterly_trend(ticker: str) -> pd.DataFrame:
     받아올 수 있는 만큼만 반환하고, 부족한 부분은 app.py에서 안내 문구로 알려줍니다.
     """
     yf_ticker = yf.Ticker(ticker)
-    quarterly_df = yf_ticker.quarterly_financials
+    try:
+        quarterly_df = yf_ticker.quarterly_financials
+    except Exception:
+        return pd.DataFrame()
     if quarterly_df.empty:
         return pd.DataFrame()
 
@@ -369,7 +470,10 @@ def get_us_quarterly_trend(ticker: str) -> pd.DataFrame:
     )
 
     # 분기별 ROE 계산을 위해 분기별 대차대조표에서 같은 분기말 자기자본을 가져옵니다.
-    equity_row = _find_equity_row(yf_ticker.quarterly_balance_sheet)
+    try:
+        equity_row = _find_equity_row(yf_ticker.quarterly_balance_sheet)
+    except Exception:
+        equity_row = None
     if equity_row is not None:
         df["ROE"] = df.apply(
             lambda row: (row["당기순이익"] / equity_row[row.name] * 100)

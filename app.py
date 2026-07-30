@@ -168,6 +168,14 @@ def render_principles_section(axes: dict) -> None:
         "5개 축을 더한 종합점수는 만들지 않으니, 각 축을 하나씩 따로 보고 판단해주세요."
     )
 
+    # 데이터 조회 서버(DART 등) 접속이 실패한 항목이 하나라도 있으면 화면 맨 위에서 한 번만 알려줍니다.
+    # (항목 하나하나마다 원인을 밝히기보다, "일부가 비어있을 수 있다"는 것만 짧게 안내합니다)
+    if any(axis.get("fetch_failed") for axis in axes.values()):
+        st.warning(
+            "⚠️ 일부 데이터를 불러오지 못했습니다. (서버 접속 지연 등으로 일부 항목이 비어있을 수 있어요 - "
+            "그 항목에는 '조회 실패'라고 표시됩니다) 새로고침하면 다시 시도합니다."
+        )
+
     # 레이더 차트는 점수가 실제로 계산됐고, 근거가 2개 이상(신뢰도 "normal")인 축만 그립니다.
     # 근거 1개짜리 축까지 그리면 극단값(예: 100점)이 다른 축과 똑같은 무게로 보여서 오해하기 쉽습니다.
     plot_labels = [label for label, axis in axes.items() if axis["score"] is not None and axis["reliability"] == "normal"]
