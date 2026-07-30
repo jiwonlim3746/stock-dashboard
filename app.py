@@ -1,16 +1,18 @@
-# 주식 정보 대시보드 (5단계: 지표 추이 그래프를 연간/분기로 전환)
+# 주식 정보 대시보드 (6단계: 투자원칙.md 5대 지표 레이더 차트 추가)
 # - 종목을 검색하면 최근 1년 주가 차트 + 최근 3년 실적(매출액/영업이익/순이익) +
-#   주요 투자지표(PER/PBR/ROE) + 지표 추이 그래프 + 최신 뉴스 10건을 함께 보여줍니다.
+#   주요 투자지표(PER/PBR/ROE) + 지표 추이 그래프 + 투자원칙 5대 지표 + 최신 뉴스 10건을 보여줍니다.
 # - 지표 이름 옆 물음표(?) 아이콘에 마우스를 올리면 쉬운 한국어 설명이 나옵니다.
 # - 사이드바에서 추이 그래프를 "연간"(점 3개) / "분기"(점 최대 12개) 중 골라 볼 수 있습니다.
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 import config  # .env 값을 미리 불러와 둡니다.
 import financials
 import glossary
 import news
+import principles
 from stock_data import (
     detect_market,
     get_korea_price_history,
@@ -153,6 +155,95 @@ def render_trend_section(trend_df: pd.DataFrame, note: str = None) -> None:
                 st.info(summary)
 
 
+def render_principles_section(axes: dict) -> None:
+    """투자원칙.md의 5대 지표를 레이더 차트 + 축별 근거로 보여주는 함수.
+
+    axes: {"① 경영진 역량·도덕성": {axis 결과 딕셔너리}, ...} 형태.
+    5개 축을 더한 "종합점수"는 절대 만들지 않고, 축별로만 보여줍니다 (사용자 요구사항).
+    """
+    st.divider()
+    st.subheader("🎯 나의 투자 원칙 5대 지표")
+    st.caption(
+        "투자원칙.md에 정리해둔 5가지 기준을 실제 데이터로 계산했습니다. "
+        "5개 축을 더한 종합점수는 만들지 않으니, 각 축을 하나씩 따로 보고 판단해주세요."
+    )
+
+    # 레이더 차트는 점수가 실제로 계산됐고, 근거가 2개 이상(신뢰도 "normal")인 축만 그립니다.
+    # 근거 1개짜리 축까지 그리면 극단값(예: 100점)이 다른 축과 똑같은 무게로 보여서 오해하기 쉽습니다.
+    plot_labels = [label for label, axis in axes.items() if axis["score"] is not None and axis["reliability"] == "normal"]
+    plot_scores = [axes[label]["score"] for label in plot_labels]
+    skipped_labels = [
+        label for label, axis in axes.items()
+        if axis["score"] is None or axis["reliability"] == "low"
+    ]
+
+    if plot_labels:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatterpolar(
+                r=plot_scores + [plot_scores[0]],  # 마지막에 첫 값을 다시 넣어야 도형이 닫힙니다.
+                theta=plot_labels + [plot_labels[0]],
+                fill="toself",
+                name="점수",
+            )
+        )
+        fig.update_layout(
+            polar={"radialaxis": {"visible": True, "range": [0, 100]}},
+            showlegend=False,
+            margin={"l": 40, "r": 40, "t": 30, "b": 30},
+            height=420,
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    if skipped_labels:
+        st.caption(f"⚠️ 데이터가 부족하거나 근거가 적어 레이더 차트에 표시하지 못한 축: {', '.join(skipped_labels)}")
+
+    for label, axis in axes.items():
+        score = axis["score"]
+        missing = axis["missing_count"]
+        is_low_reliability = axis["reliability"] == "low"
+
+        if score is None:
+            score_text = "점수 계산 불가"
+        elif is_low_reliability:
+            score_text = f"{score:.0f}점 (참고용)"
+        else:
+            score_text = f"{score:.0f}점"
+        missing_text = f" · {missing}개 항목 누락" if missing else ""
+
+        st.markdown(f"#### {label} — {score_text}{missing_text}")
+
+        # 요구사항: 점수 아래에 산출 근거를 반드시 표시
+        basis_line = " · ".join(f"{it['label']} {it['value_text']}" for it in axis["items"])
+        st.caption(basis_line)
+
+        # 근거가 1개뿐이면 점수를 그대로 믿기 어려우니, 신뢰도가 낮다고 명확히 경고합니다.
+        if is_low_reliability and score is not None:
+            st.warning(f"⚠️ 근거 {axis['scored_count']}개 — 신뢰도 낮음. 이 축은 참고만 하고 다른 근거로 직접 판단해주세요.")
+
+        if axis.get("note"):
+            st.warning(axis["note"])
+
+        # 요구사항: 점수를 펼치면 계산식과 원천 데이터를 볼 수 있게
+        with st.expander("계산식 · 원천 데이터 보기"):
+            for it in axis["items"]:
+                item_score_text = f"{it['score']:.0f}점" if it["score"] is not None else "데이터 없음"
+                st.markdown(f"**{it['label']}**: {it['value_text']} → {item_score_text}")
+                st.caption(it["detail"])
+
+            if axis.get("info"):
+                st.markdown(f"**{axis['info']['label']}**: {axis['info']['value_text']}")
+                st.caption(axis["info"]["detail"])
+
+            if axis.get("mentions"):
+                st.markdown("**사업보고서 원문 인용 (참고용, 점수에는 반영하지 않음)**")
+                for snippet in axis["mentions"]:
+                    st.markdown(f"> …{snippet}…")
+
+            st.markdown("**투자원칙.md 인용**")
+            st.caption(f"「{axis['citation']}」")
+
+
 def render_news_section(news_list: list) -> None:
     """뉴스 목록(제목/날짜/출처)을 최신순으로 나열하는 공통 함수.
 
@@ -233,6 +324,22 @@ if query:
                     )
                     render_financials_section(fin, unit_label="원", trend_df=trend_df, trend_note=trend_note)
 
+                # 투자원칙 5대 지표도 DART API 키가 있어야 조회할 수 있습니다.
+                if not config.DART_API_KEY:
+                    st.divider()
+                    st.subheader("🎯 나의 투자 원칙 5대 지표")
+                    st.warning(".env 파일에 DART_API_KEY를 입력하면 투자 원칙 지표를 볼 수 있습니다.")
+                else:
+                    with st.spinner("투자 원칙 5대 지표를 계산하는 중입니다 (peer 종목 비교 때문에 조금 걸릴 수 있어요)..."):
+                        axes = {
+                            "① 경영진 역량·도덕성": principles.get_korea_management_axis(ticker_code),
+                            "② 해자·확장성": principles.get_korea_moat_axis(ticker_code),
+                            "③ 밸류에이션": principles.get_korea_valuation_axis(ticker_code),
+                            "④ 주주환원": principles.get_korea_shareholder_return_axis(ticker_code),
+                            "⑤ 미래비전·적응력": principles.get_korea_future_vision_axis(ticker_code),
+                        }
+                    render_principles_section(axes)
+
                 # 한국 뉴스는 네이버 API 키가 있어야 조회할 수 있습니다.
                 if not config.NAVER_CLIENT_ID or not config.NAVER_CLIENT_SECRET:
                     st.divider()
@@ -263,6 +370,16 @@ if query:
                 lambda: financials.get_us_quarterly_trend(ticker),
             )
             render_financials_section(fin, unit_label="달러", trend_df=trend_df, trend_note=trend_note)
+
+            with st.spinner("투자 원칙 5대 지표를 계산하는 중입니다 (peer 종목 비교 때문에 조금 걸릴 수 있어요)..."):
+                axes = {
+                    "① 경영진 역량·도덕성": principles.get_us_management_axis(ticker),
+                    "② 해자·확장성": principles.get_us_moat_axis(ticker),
+                    "③ 밸류에이션": principles.get_us_valuation_axis(ticker),
+                    "④ 주주환원": principles.get_us_shareholder_return_axis(ticker),
+                    "⑤ 미래비전·적응력": principles.get_us_future_vision_axis(ticker),
+                }
+            render_principles_section(axes)
 
             news_list = news.get_us_news(ticker)
             render_news_section(news_list)

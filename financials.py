@@ -61,7 +61,7 @@ def _to_number(value) -> Optional[float]:
 # ------------------------------
 
 @st.cache_data(ttl=60 * 60 * 24)  # 용량이 큰 파일이라 하루 동안만 캐시합니다.
-def _get_dart_corp_code_map() -> dict:
+def get_dart_corp_code_map() -> dict:
     """DART의 '종목코드 -> 고유번호(corp_code)' 매핑을 가져옵니다."""
     if not DART_API_KEY:
         return {}
@@ -131,21 +131,25 @@ def _extract_accounts(df: pd.DataFrame) -> dict:
 
 
 @st.cache_data(ttl=3600)
-def get_korea_financials(ticker_code: str) -> dict:
-    """한국 주식의 최근 3년 실적과 PER/PBR/ROE를 가져옵니다."""
+def get_korea_financials(ticker_code: str, years: int = 3) -> dict:
+    """한국 주식의 최근 N년(기본 3년) 실적과 PER/PBR/ROE를 가져옵니다.
+
+    years를 5로 주면 5개년치를 가져오는데, 이는 principles.py(투자원칙 5대 지표)에서
+    "ROE 5년 표준편차"처럼 더 긴 기간이 필요할 때 재사용하기 위한 것입니다.
+    """
     if not DART_API_KEY:
         return EMPTY_RESULT
 
-    corp_map = _get_dart_corp_code_map()
+    corp_map = get_dart_corp_code_map()
     corp_code = corp_map.get(ticker_code)
     if corp_code is None:
         return EMPTY_RESULT
 
-    # 사업보고서는 다음 해 3~4월에 공시되므로, 최신 연도부터 순서대로
-    # 조회해서 실제로 데이터가 있는 연도만 모읍니다. (최대 최근 3개년)
+    # 사업보고서는 다음 해 3~4월에 공시되므로, 최신 연도부터 순서대로 조회해서
+    # 실제로 데이터가 있는 연도만 모읍니다. (혹시 중간에 결측 연도가 있을 수 있어 2년 여유를 둡니다)
     current_year = datetime.today().year
     records = []
-    for year in [current_year - 1, current_year - 2, current_year - 3, current_year - 4]:
+    for year in range(current_year - 1, current_year - 1 - (years + 2), -1):
         df = _get_dart_accounts(corp_code, year)  # 기본값(reprt_code="11011")은 사업보고서(연간)
         if df.empty:
             continue
@@ -153,7 +157,7 @@ def get_korea_financials(ticker_code: str) -> dict:
         row = {"연도": year, **_extract_accounts(df)}
         records.append(row)
 
-        if len(records) == 3:  # 3개년치를 모았으면 그만 조회합니다.
+        if len(records) == years:  # 원하는 개수만큼 모았으면 그만 조회합니다.
             break
 
     if not records:
@@ -215,7 +219,7 @@ def get_korea_quarterly_trend(ticker_code: str) -> pd.DataFrame:
     if not DART_API_KEY:
         return pd.DataFrame()
 
-    corp_map = _get_dart_corp_code_map()
+    corp_map = get_dart_corp_code_map()
     corp_code = corp_map.get(ticker_code)
     if corp_code is None:
         return pd.DataFrame()
@@ -290,8 +294,11 @@ def _find_equity_row(balance_df: pd.DataFrame) -> Optional[pd.Series]:
 
 
 @st.cache_data(ttl=3600)
-def get_us_financials(ticker: str) -> dict:
-    """미국 주식의 최근 3년 실적과 PER/PBR/ROE를 가져옵니다."""
+def get_us_financials(ticker: str, years: int = 3) -> dict:
+    """미국 주식의 최근 N년(기본 3년) 실적과 PER/PBR/ROE를 가져옵니다.
+
+    yfinance는 무료로는 연간 재무제표를 최대 5개년까지만 제공합니다.
+    """
     yf_ticker = yf.Ticker(ticker)
 
     financials_df = yf_ticker.financials  # 연간 손익계산서 (최근 연도가 첫 컬럼)
@@ -299,7 +306,7 @@ def get_us_financials(ticker: str) -> dict:
     trend_df = pd.DataFrame()
     if not financials_df.empty:
         rows = [r for r in ["Total Revenue", "Operating Income", "Net Income"] if r in financials_df.index]
-        full_df = financials_df.loc[rows].iloc[:, :3]  # 최근 3개년만 사용
+        full_df = financials_df.loc[rows].iloc[:, :years]  # 최근 N개년만 사용
         full_df = full_df.rename(columns=lambda c: c.year)
         full_df = full_df.T.sort_index()
         full_df = full_df.rename(

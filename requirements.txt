@@ -4,3 +4,4 @@ finance-datareader
 yfinance
 python-dotenv
 requests
+plotly
