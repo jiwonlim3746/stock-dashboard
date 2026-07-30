@@ -1,0 +1,6 @@
+streamlit
+pandas
+finance-datareader
+yfinance
+python-dotenv
+requests
