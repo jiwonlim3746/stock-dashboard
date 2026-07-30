@@ -1,5 +1,8 @@
 .env
 
+# Streamlit Cloud의 Secrets를 로컬에서 테스트할 때 만들 수 있는 파일 (역시 API 키가 들어있어서 제외)
+.streamlit/secrets.toml
+
 # 파이썬이 실행할 때 자동으로 만드는 캐시 폴더/파일 (백업할 필요 없음)
 __pycache__/
 *.pyc

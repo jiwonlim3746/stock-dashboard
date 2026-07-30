@@ -1,6 +1,6 @@
-streamlit
-pandas
-finance-datareader
-yfinance
-python-dotenv
-requests
+streamlit>=1.60.0
+pandas>=2.3.3
+finance-datareader>=0.9.202
+yfinance>=1.5.2
+python-dotenv>=1.2.2
+requests>=2.34.2
