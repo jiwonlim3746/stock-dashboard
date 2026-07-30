@@ -157,6 +157,38 @@ def _get_peer_metrics(market: str, ticker: str) -> dict:
     return {"per": fin["per"], "pbr": fin["pbr"], "gross_margin": gross_margin, "operating_margin": operating_margin}
 
 
+PEER_CACHE_STALE_DAYS = 7  # 이 일수보다 오래되면 "오래됐다"고 경고합니다. PER/PBR은 주가로 매일 바뀌기 때문입니다.
+
+
+def _get_peer_cache_info() -> dict:
+    """peer_cache.json이 언제 만들어졌는지, 며칠이나 지났는지 알려줍니다.
+
+    PER/PBR은 주가가 바뀔 때마다 함께 바뀌는 값이라, 캐시 파일을 만든 날짜와
+    지금 날짜가 얼마나 차이 나는지를 화면에 같이 보여줘야 사용자가 얼마나
+    믿을지 판단할 수 있습니다.
+
+    반환값: {"date_str": "2026-07-31" 형태 문자열 또는 None, "is_stale": bool, "days_old": int 또는 None}
+    """
+    cache = _load_peer_cache()
+    generated_at_str = cache.get("generated_at")
+    if not generated_at_str:
+        return {"date_str": None, "is_stale": False, "days_old": None}
+
+    try:
+        generated_at = datetime.fromisoformat(generated_at_str)
+    except ValueError:
+        return {"date_str": None, "is_stale": False, "days_old": None}
+
+    # build_peer_cache.py가 timezone-aware(UTC) 시각을 저장하므로, 비교할 "지금"도 같은 기준으로 맞춥니다.
+    now = datetime.now(generated_at.tzinfo) if generated_at.tzinfo else datetime.now()
+    days_old = (now - generated_at).days
+    return {
+        "date_str": generated_at.strftime("%Y-%m-%d"),
+        "is_stale": days_old >= PEER_CACHE_STALE_DAYS,
+        "days_old": days_old,
+    }
+
+
 # ------------------------------
 # 공용 유틸리티
 # ------------------------------
@@ -641,18 +673,28 @@ def get_korea_moat_axis(ticker_code: str) -> dict:
     else:
         peer_note = "이 종목의 업종을 대표 peer 목록에서 찾지 못해 상대 비교를 생략했습니다."
 
+    # peer_cache.json의 PER/PBR/마진 값은 주가처럼 매일 바뀔 수 있는 값을 담고 있어서,
+    # 언제 기준으로 계산했는지 항상 함께 보여줍니다.
+    peer_cache_info = _get_peer_cache_info() if sector else {}
+    peer_cache_suffix = _peer_cache_suffix(peer_cache_info)
+    peer_cache_sentence = (
+        f" (peer 데이터 기준일: {peer_cache_info['date_str']})" if peer_cache_info.get("date_str") else ""
+    )
+
     items = [
         {
             "label": "영업이익률 (peer 대비 상대수준)",
             "value_text": (
                 "데이터 없음 (조회 실패)" if fin5_failed else (
-                    f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
-                    if op_margin_latest is not None and op_margin_delta is not None
-                    else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                    (
+                        f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
+                        if op_margin_latest is not None and op_margin_delta is not None
+                        else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                    ) + peer_cache_suffix
                 )
             ),
             "score": _score_relative_margin(op_margin_delta),
-            "detail": "최신 연도 영업이익률을 같은 업종 대표 종목 평균과 비교합니다. " + (peer_note or ""),
+            "detail": "최신 연도 영업이익률을 같은 업종 대표 종목 평균과 비교합니다. " + (peer_note or "") + peer_cache_sentence,
             "fetch_failed": fin5_failed,
         },
         {
@@ -666,13 +708,15 @@ def get_korea_moat_axis(ticker_code: str) -> dict:
             "label": "매출총이익률 (peer 대비 상대수준)",
             "value_text": (
                 "데이터 없음 (조회 실패)" if gross_margin_failed else (
-                    f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
-                    if gross_margin is not None and gross_margin_delta is not None
-                    else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                    (
+                        f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
+                        if gross_margin is not None and gross_margin_delta is not None
+                        else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                    ) + peer_cache_suffix
                 )
             ),
             "score": _score_relative_margin(gross_margin_delta),
-            "detail": "매출총이익률(=매출총이익/매출액)을 같은 업종 대표 종목 평균과 비교합니다.",
+            "detail": "매출총이익률(=매출총이익/매출액)을 같은 업종 대표 종목 평균과 비교합니다." + peer_cache_sentence,
             "fetch_failed": gross_margin_failed,
         },
         {
@@ -775,6 +819,20 @@ def _format_peer_breakdown(peer_details: list) -> str:
         label = d["name"] if d["name"] == d["code"] else f"{d['name']}({d['code']})"
         parts.append(f"{label} {per_text}·{pbr_text}")
     return ", ".join(parts) if parts else "peer 없음"
+
+
+def _peer_cache_suffix(cache_info: dict) -> str:
+    """peer 비교 항목의 value_text 뒤에 붙일 '기준일 / 오래됨 경고' 문구를 만듭니다.
+
+    PER/PBR은 주가가 바뀔 때마다 함께 바뀌는 값이라 peer_cache.json이 낡으면
+    비교 결과도 낡습니다. 그래서 항목을 펼쳐보지 않아도 기준일이 바로 보이게 합니다.
+    """
+    if not cache_info.get("date_str"):
+        return ""
+    suffix = f" [peer 기준일: {cache_info['date_str']}]"
+    if cache_info.get("is_stale"):
+        suffix += f" ⚠️ peer 데이터가 오래됐습니다 ({cache_info['days_old']}일 지남)"
+    return suffix
 
 
 def _band_position_percentile(current: float, historical: list) -> tuple:
@@ -945,6 +1003,13 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
 
     diverging_note = _diverging_valuation_note(per_delta_pct, pbr_delta_pct)
 
+    # peer_cache.json의 PER/PBR은 주가로 매일 바뀌는 값이라, 기준일을 항상 함께 보여줍니다.
+    peer_cache_info = _get_peer_cache_info() if sector else {}
+    peer_cache_suffix = _peer_cache_suffix(peer_cache_info)
+    peer_cache_sentence = (
+        f" (peer 데이터 기준일: {peer_cache_info['date_str']})" if peer_cache_info.get("date_str") else ""
+    )
+
     band, band_failed = _safe_call(get_korea_per_band_percentile, ticker_code)
     percentile = band["percentile"] if band else None
     out_of_range = band.get("out_of_range", False) if band else False
@@ -966,10 +1031,10 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
         },
         {
             "label": "PER peer 대비 (참고용)",
-            "value_text": "PER " + _format_peer_comparison(per, peer_median_per, peer_names) + (" ⚠️" if diverging_note else ""),
+            "value_text": "PER " + _format_peer_comparison(per, peer_median_per, peer_names) + peer_cache_suffix + (" ⚠️" if diverging_note else ""),
             "score": _score_relative_valuation(per_delta_pct),
             "detail": (
-                "같은 업종 대표 종목 중앙값 PER과 비교합니다. " + (peer_note or "")
+                "같은 업종 대표 종목 중앙값 PER과 비교합니다. " + (peer_note or "") + peer_cache_sentence
                 + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서(peer가 2~3개뿐이라 표본이 작음) "
                 "참고용으로만 보고, 아래 '3년 자기 PER 밴드'에 더 큰 비중을 뒀습니다."
@@ -978,10 +1043,10 @@ def get_korea_valuation_axis(ticker_code: str) -> dict:
         },
         {
             "label": "PBR peer 대비 (참고용)",
-            "value_text": "PBR " + _format_peer_comparison(pbr, peer_median_pbr, peer_names) + (" ⚠️" if diverging_note else ""),
+            "value_text": "PBR " + _format_peer_comparison(pbr, peer_median_pbr, peer_names) + peer_cache_suffix + (" ⚠️" if diverging_note else ""),
             "score": _score_relative_valuation(pbr_delta_pct),
             "detail": (
-                "같은 업종 대표 종목 중앙값 PBR과 비교합니다." + (f" {diverging_note}" if diverging_note else "")
+                "같은 업종 대표 종목 중앙값 PBR과 비교합니다." + peer_cache_sentence + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서 참고용으로만 봅니다."
             ),
             "fetch_failed": fin_failed,
@@ -1733,18 +1798,27 @@ def get_us_moat_axis(ticker: str) -> dict:
     else:
         peer_note = "이 종목의 industry를 대표 peer 목록에서 찾지 못해 상대 비교를 생략했습니다."
 
+    # peer_cache.json의 마진 값은 시점에 따라 바뀔 수 있어서, 기준일을 항상 함께 보여줍니다.
+    peer_cache_info = _get_peer_cache_info() if sector else {}
+    peer_cache_suffix = _peer_cache_suffix(peer_cache_info)
+    peer_cache_sentence = (
+        f" (peer 데이터 기준일: {peer_cache_info['date_str']})" if peer_cache_info.get("date_str") else ""
+    )
+
     items = [
         {
             "label": "영업이익률 (peer 대비 상대수준)",
             "value_text": (
                 "데이터 없음 (조회 실패)" if fin5_failed else (
-                    f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
-                    if op_margin_latest is not None and op_margin_delta is not None
-                    else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                    (
+                        f"{op_margin_latest:.1f}% (peer 대비 {op_margin_delta:+.1f}%p)"
+                        if op_margin_latest is not None and op_margin_delta is not None
+                        else (f"{op_margin_latest:.1f}% (peer 비교 불가)" if op_margin_latest is not None else "데이터 없음")
+                    ) + peer_cache_suffix
                 )
             ),
             "score": _score_relative_margin(op_margin_delta),
-            "detail": "최신 연도 영업이익률을 같은 industry 대표 종목 평균과 비교합니다. " + (peer_note or ""),
+            "detail": "최신 연도 영업이익률을 같은 industry 대표 종목 평균과 비교합니다. " + (peer_note or "") + peer_cache_sentence,
             "fetch_failed": fin5_failed,
         },
         {
@@ -1758,13 +1832,15 @@ def get_us_moat_axis(ticker: str) -> dict:
             "label": "매출총이익률 (peer 대비 상대수준)",
             "value_text": (
                 "데이터 없음 (조회 실패)" if gross_margin_failed else (
-                    f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
-                    if gross_margin is not None and gross_margin_delta is not None
-                    else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                    (
+                        f"{gross_margin:.1f}% (peer 대비 {gross_margin_delta:+.1f}%p)"
+                        if gross_margin is not None and gross_margin_delta is not None
+                        else (f"{gross_margin:.1f}% (peer 비교 불가)" if gross_margin is not None else "데이터 없음")
+                    ) + peer_cache_suffix
                 )
             ),
             "score": _score_relative_margin(gross_margin_delta),
-            "detail": "매출총이익률을 같은 industry 대표 종목 평균과 비교합니다.",
+            "detail": "매출총이익률을 같은 industry 대표 종목 평균과 비교합니다." + peer_cache_sentence,
             "fetch_failed": gross_margin_failed,
         },
         {
@@ -1897,6 +1973,13 @@ def get_us_valuation_axis(ticker: str) -> dict:
 
     diverging_note = _diverging_valuation_note(per_delta_pct, pbr_delta_pct)
 
+    # peer_cache.json의 PER/PBR은 주가로 매일 바뀌는 값이라, 기준일을 항상 함께 보여줍니다.
+    peer_cache_info = _get_peer_cache_info() if sector else {}
+    peer_cache_suffix = _peer_cache_suffix(peer_cache_info)
+    peer_cache_sentence = (
+        f" (peer 데이터 기준일: {peer_cache_info['date_str']})" if peer_cache_info.get("date_str") else ""
+    )
+
     band, band_failed = _safe_call(get_us_per_band_percentile, ticker)
     percentile = band["percentile"] if band else None
     out_of_range = band.get("out_of_range", False) if band else False
@@ -1918,10 +2001,10 @@ def get_us_valuation_axis(ticker: str) -> dict:
         },
         {
             "label": "PER peer 대비 (참고용)",
-            "value_text": "PER " + _format_peer_comparison(per, peer_median_per, peer_names) + (" ⚠️" if diverging_note else ""),
+            "value_text": "PER " + _format_peer_comparison(per, peer_median_per, peer_names) + peer_cache_suffix + (" ⚠️" if diverging_note else ""),
             "score": _score_relative_valuation(per_delta_pct),
             "detail": (
-                "같은 industry 대표 종목 중앙값 PER과 비교합니다. " + (peer_note or "")
+                "같은 industry 대표 종목 중앙값 PER과 비교합니다. " + (peer_note or "") + peer_cache_sentence
                 + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서(peer가 2~3개뿐이라 표본이 작음) "
                 "참고용으로만 보고, 아래 '3년 자기 PER 밴드'에 더 큰 비중을 뒀습니다."
@@ -1930,10 +2013,10 @@ def get_us_valuation_axis(ticker: str) -> dict:
         },
         {
             "label": "PBR peer 대비 (참고용)",
-            "value_text": "PBR " + _format_peer_comparison(pbr, peer_median_pbr, peer_names) + (" ⚠️" if diverging_note else ""),
+            "value_text": "PBR " + _format_peer_comparison(pbr, peer_median_pbr, peer_names) + peer_cache_suffix + (" ⚠️" if diverging_note else ""),
             "score": _score_relative_valuation(pbr_delta_pct),
             "detail": (
-                "같은 industry 대표 종목 중앙값 PBR과 비교합니다." + (f" {diverging_note}" if diverging_note else "")
+                "같은 industry 대표 종목 중앙값 PBR과 비교합니다." + peer_cache_sentence + (f" {diverging_note}" if diverging_note else "")
                 + " ⚠️ peer를 누구로 고르느냐에 따라 결론이 바뀔 수 있어서 참고용으로만 봅니다."
             ),
             "fetch_failed": fin_failed,
